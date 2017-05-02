@@ -7,7 +7,7 @@ Desugaring foreign calls
 -}
 
 {-# LANGUAGE CPP #-}
-module Language.Haskell.Liquid.Desugar.DsCCall
+module DsCCall
         ( dsCCall
         , mkFCall
         , unboxArg
@@ -15,33 +15,34 @@ module Language.Haskell.Liquid.Desugar.DsCCall
         , resultWrapper
         ) where
 
--- #include "HsVersions.h"
+#include "HsVersions.h"
 
-import Prelude hiding (error)
+
 import CoreSyn
 
 import DsMonad
-
 import CoreUtils
 import MkCore
-import Var
 import MkId
 import ForeignCall
 import DataCon
+import DsUtils
 
 import TcType
 import Type
+import Id   ( Id )
 import Coercion
 import PrimOp
 import TysPrim
 import TyCon
 import TysWiredIn
 import BasicTypes
+import FastString ( unpackFS )
 import Literal
 import PrelNames
-import VarSet
 import DynFlags
 import Outputable
+import Util
 
 import Data.Maybe
 
@@ -94,14 +95,14 @@ dsCCall lbl args may_gc result_ty
        uniq <- newUnique
        dflags <- getDynFlags
        let
-           target = StaticTarget lbl Nothing True
+           target = StaticTarget (unpackFS lbl) lbl Nothing True
            the_fcall    = CCall (CCallSpec target CCallConv may_gc)
            the_prim_app = mkFCall dflags uniq the_fcall unboxed_args ccall_result_ty
        return (foldr ($) (res_wrapper the_prim_app) arg_wrappers)
 
 mkFCall :: DynFlags -> Unique -> ForeignCall
-        -> [CoreExpr]   -- Args
-        -> Type         -- Result type
+        -> [CoreExpr]     -- Args
+        -> Type           -- Result type
         -> CoreExpr
 -- Construct the ccall.  The only tricky bit is that the ccall Id should have
 -- no free vars, so if any of the arg tys do we must give it a polymorphic type.
@@ -113,12 +114,13 @@ mkFCall :: DynFlags -> Unique -> ForeignCall
 --      (ccallid::(forall a b.  StablePtr (a -> b) -> Addr -> Char -> IO Addr))
 --                      a b s x c
 mkFCall dflags uniq the_fcall val_args res_ty
-  = mkApps (mkVarApps (Var the_fcall_id) tyvars) val_args
+  = ASSERT( all isTyVar tyvars )  -- this must be true because the type is top-level
+    mkApps (mkVarApps (Var the_fcall_id) tyvars) val_args
   where
     arg_tys = map exprType val_args
     body_ty = (mkFunTys arg_tys res_ty)
-    tyvars  = varSetElems (tyVarsOfType body_ty)
-    ty      = mkForAllTys tyvars body_ty
+    tyvars  = tyCoVarsOfTypeWellScoped body_ty
+    ty      = mkInvForAllTys tyvars body_ty
     the_fcall_id = mkFCallId dflags uniq the_fcall ty
 
 unboxArg :: CoreExpr                    -- The supplied argument
@@ -136,7 +138,7 @@ unboxArg arg
 
   -- Recursive newtypes
   | Just(co, _rep_ty) <- topNormaliseNewType_maybe arg_ty
-  = unboxArg (mkCast arg co)
+  = unboxArg (mkCastDs arg co)
 
   -- Booleans
   | Just tc <- tyConAppTyCon_maybe arg_ty,
@@ -155,7 +157,7 @@ unboxArg arg
   -- Data types with a single constructor, which has a single, primitive-typed arg
   -- This deals with Int, Float etc; also Ptr, ForeignPtr
   | is_product_type && data_con_arity == 1
-  = -- ASSERT2(isUnLiftedType data_con_arg_ty1, pprType arg_ty)
+  = ASSERT2(isUnliftedType data_con_arg_ty1, pprType arg_ty)
                         -- Typechecker ensures this
     do case_bndr <- newSysLocalDs arg_ty
        prim_arg <- newSysLocalDs data_con_arg_ty1
@@ -225,9 +227,9 @@ boxResult result_ty
                      _ -> []
 
               return_result state anss
-                = mkCoreConApps (tupleCon UnboxedTuple (2 + length extra_result_tys))
-                                (map Type (realWorldStatePrimTy : io_res_ty : extra_result_tys)
-                                 ++ (state : anss))
+                = mkCoreUbxTup
+                    (realWorldStatePrimTy : io_res_ty : extra_result_tys)
+                    (state : anss)
 
         ; (ccall_res_ty, the_alt) <- mk_alt return_result res
 
@@ -273,8 +275,8 @@ mk_alt return_result (Nothing, wrap_result)
              the_rhs = return_result (Var state_id)
                                      [wrap_result (panic "boxResult")]
 
-             ccall_res_ty = mkTyConApp unboxedSingletonTyCon [realWorldStatePrimTy]
-             the_alt      = (DataAlt unboxedSingletonDataCon, [state_id], the_rhs)
+             ccall_res_ty = mkTupleTy Unboxed [realWorldStatePrimTy]
+             the_alt      = (DataAlt (tupleDataCon Unboxed 1), [state_id], the_rhs)
 
        return (ccall_res_ty, the_alt)
 
@@ -289,9 +291,8 @@ mk_alt return_result (Just prim_res_ty, wrap_result)
     let
         the_rhs = return_result (Var state_id)
                                 (wrap_result (Var result_id) : map Var as)
-        ccall_res_ty = mkTyConApp (tupleTyCon UnboxedTuple arity)
-                                  (realWorldStatePrimTy : ls)
-        the_alt      = ( DataAlt (tupleCon UnboxedTuple arity)
+        ccall_res_ty = mkTupleTy Unboxed (realWorldStatePrimTy : ls)
+        the_alt      = ( DataAlt (tupleDataCon Unboxed arity)
                        , (state_id : args_ids)
                        , the_rhs
                        )
@@ -303,8 +304,8 @@ mk_alt return_result (Just prim_res_ty, wrap_result)
     let
         the_rhs = return_result (Var state_id)
                                 [wrap_result (Var result_id)]
-        ccall_res_ty = mkTyConApp unboxedPairTyCon [realWorldStatePrimTy, prim_res_ty]
-        the_alt      = (DataAlt unboxedPairDataCon, [state_id, result_id], the_rhs)
+        ccall_res_ty = mkTupleTy Unboxed [realWorldStatePrimTy, prim_res_ty]
+        the_alt      = (DataAlt (tupleDataCon Unboxed 2), [state_id, result_id], the_rhs)
     return (ccall_res_ty, the_alt)
 
 
@@ -336,7 +337,7 @@ resultWrapper result_ty
   -- Newtypes
   | Just (co, rep_ty) <- topNormaliseNewType_maybe result_ty
   = do (maybe_ty, wrapper) <- resultWrapper rep_ty
-       return (maybe_ty, \e -> mkCast (wrapper e) (mkSymCo co))
+       return (maybe_ty, \e -> mkCastDs (wrapper e) (mkSymCo co))
 
   -- The type might contain foralls (eg. for dummy type arguments,
   -- referring to 'Ptr a' is legal).

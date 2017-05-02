@@ -11,7 +11,7 @@ This module exports some utility functions of no great interest.
 {-# LANGUAGE CPP #-}
 
 -- | Utility functions for constructing Core syntax, principally for desugaring
-module Language.Haskell.Liquid.Desugar.DsUtils (
+module DsUtils (
         EquationInfo(..),
         firstPat, shiftEqns,
 
@@ -30,25 +30,24 @@ module Language.Haskell.Liquid.Desugar.DsUtils (
 
         -- LHs tuples
         mkLHsVarPatTup, mkLHsPatTup, mkVanillaTuplePat,
-        mkBigLHsVarTup, mkBigLHsTup, mkBigLHsVarPatTup, mkBigLHsPatTup,
+        mkBigLHsVarTupId, mkBigLHsTupId, mkBigLHsVarPatTupId, mkBigLHsPatTupId,
 
         mkSelectorBinds,
 
         selectSimpleMatchVarL, selectMatchVars, selectMatchVar,
-        mkOptTickBox, mkBinaryTickBox
+        mkOptTickBox, mkBinaryTickBox, decideBangHood
     ) where
 
--- #include "HsVersions.h"
+#include "HsVersions.h"
 
-import {-# SOURCE #-}   Language.Haskell.Liquid.Desugar.Match ( matchSimply )
+import {-# SOURCE #-}   Match ( matchSimply )
 
 import HsSyn
 import TcHsSyn
-import Coercion( Coercion, isReflCo )
 import TcType( tcSplitTyConApp )
 import CoreSyn
 import DsMonad
-import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr ( dsLExpr )
+import {-# SOURCE #-} DsExpr ( dsLExpr )
 
 import CoreUtils
 import MkCore
@@ -56,13 +55,15 @@ import MkId
 import Id
 import Literal
 import TyCon
-import ConLike
+-- import ConLike
 import DataCon
 import PatSyn
 import Type
+import Coercion
 import TysPrim
 import TysWiredIn
 import BasicTypes
+import ConLike
 import UniqSet
 import UniqSupply
 import Module
@@ -72,6 +73,7 @@ import SrcLoc
 import Util
 import DynFlags
 import FastString
+import qualified GHC.LanguageExtensions as LangExt
 
 import TcEvidence
 
@@ -116,7 +118,8 @@ selectMatchVar :: Pat Id -> DsM Id
 selectMatchVar (BangPat pat) = selectMatchVar (unLoc pat)
 selectMatchVar (LazyPat pat) = selectMatchVar (unLoc pat)
 selectMatchVar (ParPat pat)  = selectMatchVar (unLoc pat)
-selectMatchVar (VarPat var)  = return (localiseId var)  -- Note [Localise pattern binders]
+selectMatchVar (VarPat var)  = return (localiseId (unLoc var))
+                                  -- Note [Localise pattern binders]
 selectMatchVar (AsPat var _) = return (unLoc var)
 selectMatchVar other_pat     = newSysLocalDs (hsPatType other_pat)
                                   -- OK, better make up one...
@@ -172,7 +175,7 @@ worthy of a type synonym and a few handy functions.
 -}
 
 firstPat :: EquationInfo -> Pat Id
-firstPat eqn = {- ASSERT( notNull (eqn_pats eqn) ) -} head (eqn_pats eqn)
+firstPat eqn = ASSERT( notNull (eqn_pats eqn) ) head (eqn_pats eqn)
 
 shiftEqns :: [EquationInfo] -> [EquationInfo]
 -- Drop the first pattern in each equation
@@ -237,11 +240,11 @@ seqVar var body = Case (Var var) var (exprType body)
 mkCoLetMatchResult :: CoreBind -> MatchResult -> MatchResult
 mkCoLetMatchResult bind = adjustMatchResult (mkCoreLet bind)
 
--- (mkViewMatchResult var' viewExpr var mr) makes the expression
--- let var' = viewExpr var in mr
-mkViewMatchResult :: Id -> CoreExpr -> Id -> MatchResult -> MatchResult
-mkViewMatchResult var' viewExpr var =
-    adjustMatchResult (mkCoreLet (NonRec var' (mkCoreAppDs viewExpr (Var var))))
+-- (mkViewMatchResult var' viewExpr mr) makes the expression
+-- let var' = viewExpr in mr
+mkViewMatchResult :: Id -> CoreExpr -> MatchResult -> MatchResult
+mkViewMatchResult var' viewExpr =
+    adjustMatchResult (mkCoreLet (NonRec var' viewExpr))
 
 mkEvalMatchResult :: Id -> Type -> MatchResult -> MatchResult
 mkEvalMatchResult var ty
@@ -252,10 +255,10 @@ mkGuardedMatchResult pred_expr (MatchResult _ body_fn)
   = MatchResult CanFail (\fail -> do body <- body_fn fail
                                      return (mkIfThenElse pred_expr body fail))
 
-mkCoPrimCaseMatchResult :: Id                           -- Scrutinee
-                    -> Type                             -- Type of the case
-                    -> [(Literal, MatchResult)]         -- Alternatives
-                    -> MatchResult                      -- Literals are all unlifted
+mkCoPrimCaseMatchResult :: Id                        -- Scrutinee
+                        -> Type                      -- Type of the case
+                        -> [(Literal, MatchResult)]  -- Alternatives
+                        -> MatchResult               -- Literals are all unlifted
 mkCoPrimCaseMatchResult var ty match_alts
   = MatchResult CanFail mk_case
   where
@@ -265,12 +268,12 @@ mkCoPrimCaseMatchResult var ty match_alts
 
     sorted_alts = sortWith fst match_alts       -- Right order for a Case
     mk_alt fail (lit, MatchResult _ body_fn)
-       = -- ASSERT( not (litIsLifted lit) )
+       = ASSERT( not (litIsLifted lit) )
          do body <- body_fn fail
             return (LitAlt lit, [], body)
 
 data CaseAlt a = MkCaseAlt{ alt_pat :: a,
-                            alt_bndrs :: [CoreBndr],
+                            alt_bndrs :: [Var],
                             alt_wrapper :: HsWrapper,
                             alt_result :: MatchResult }
 
@@ -282,7 +285,7 @@ mkCoAlgCaseMatchResult
   -> MatchResult
 mkCoAlgCaseMatchResult dflags var ty match_alts
   | isNewtype  -- Newtype case; use a let
-  = -- ASSERT( null (tail match_alts) && null (tail arg_ids1) )
+  = ASSERT( null (tail match_alts) && null (tail arg_ids1) )
     mkCoLetMatchResult (NonRec arg_id1 newtype_rhs) match_result1
 
   | isPArrFakeAlts match_alts
@@ -296,9 +299,9 @@ mkCoAlgCaseMatchResult dflags var ty match_alts
         --  the scrutinised Id to be sufficiently refined to have a TyCon in it]
 
     alt1@MkCaseAlt{ alt_bndrs = arg_ids1, alt_result = match_result1 }
-      = {- ASSERT( notNull match_alts ) -} head match_alts
+      = ASSERT( notNull match_alts ) head match_alts
     -- Stuff for newtype
-    arg_id1       = {- ASSERT( notNull arg_ids1 ) -} head arg_ids1
+    arg_id1       = ASSERT( notNull arg_ids1 ) head arg_ids1
     var_ty        = idType var
     (tc, ty_args) = tcSplitTyConApp var_ty      -- Don't look through newtypes
                                                 -- (not that splitTyConApp does, these days)
@@ -340,10 +343,11 @@ sort_alts = sortWith (dataConTag . alt_pat)
 
 mkPatSynCase :: Id -> Type -> CaseAlt PatSyn -> CoreExpr -> DsM CoreExpr
 mkPatSynCase var ty alt fail = do
-    matcher <- dsLExpr $ mkLHsWrap wrapper $ nlHsTyApp matcher [ty]
+    matcher <- dsLExpr $ mkLHsWrap wrapper $
+                         nlHsTyApp matcher [getRuntimeRep "mkPatSynCase" ty, ty]
     let MatchResult _ mkCont = match_result
     cont <- mkCoreLams bndrs <$> mkCont fail
-    return $ mkCoreAppsDs matcher [Var var, ensure_unstrict cont, Lam voidArgId fail]
+    return $ mkCoreAppsDs (text "patsyn" <+> ppr var) matcher [Var var, ensure_unstrict cont, Lam voidArgId fail]
   where
     MkCaseAlt{ alt_pat = psyn,
                alt_bndrs = bndrs,
@@ -463,10 +467,10 @@ mkErrorAppDs err_id ty msg = do
     src_loc <- getSrcSpanDs
     dflags <- getDynFlags
     let
-        full_msg = showSDoc dflags (hcat [ppr src_loc, text "|", msg])
+        full_msg = showSDoc dflags (hcat [ppr src_loc, vbar, msg])
         core_msg = Lit (mkMachString full_msg)
         -- mkMachString returns a result of type String#
-    return (mkApps (Var err_id) [Type ty, core_msg])
+    return (mkApps (Var err_id) [Type (getRuntimeRep "mkErrorAppDs" ty), Type ty, core_msg])
 
 {-
 'mkCoreAppDs' and 'mkCoreAppsDs' hand the special-case desugaring of 'seq'.
@@ -536,8 +540,8 @@ into
 which stupidly tries to bind the datacon 'True'.
 -}
 
-mkCoreAppDs  :: CoreExpr -> CoreExpr -> CoreExpr
-mkCoreAppDs (Var f `App` Type ty1 `App` Type ty2 `App` arg1) arg2
+mkCoreAppDs  :: SDoc -> CoreExpr -> CoreExpr -> CoreExpr
+mkCoreAppDs _ (Var f `App` Type ty1 `App` Type ty2 `App` arg1) arg2
   | f `hasKey` seqIdKey            -- Note [Desugaring seq (1), (2)]
   = Case arg1 case_bndr ty2 [(DEFAULT,[],arg2)]
   where
@@ -545,10 +549,10 @@ mkCoreAppDs (Var f `App` Type ty1 `App` Type ty2 `App` arg1) arg2
                    Var v1 | isLocalId v1 -> v1        -- Note [Desugaring seq (2) and (3)]
                    _                     -> mkWildValBinder ty1
 
-mkCoreAppDs fun arg = mkCoreApp fun arg  -- The rest is done in MkCore
+mkCoreAppDs s fun arg = mkCoreApp s fun arg  -- The rest is done in MkCore
 
-mkCoreAppsDs :: CoreExpr -> [CoreExpr] -> CoreExpr
-mkCoreAppsDs fun args = foldl mkCoreAppDs fun args
+mkCoreAppsDs :: SDoc -> CoreExpr -> [CoreExpr] -> CoreExpr
+mkCoreAppsDs s fun args = foldl (mkCoreAppDs s) fun args
 
 mkCastDs :: CoreExpr -> Coercion -> CoreExpr
 -- We define a desugarer-specific verison of CoreUtils.mkCast,
@@ -565,7 +569,7 @@ mkCastDs e co | isReflCo co = e
 {-
 ************************************************************************
 *                                                                      *
-\subsection[mkSelectorBind]{Make a selector bind}
+               Tuples and selector bindings
 *                                                                      *
 ************************************************************************
 
@@ -587,121 +591,225 @@ expressions.
 
 Note [mkSelectorBinds]
 ~~~~~~~~~~~~~~~~~~~~~~
-Given   p = e, where p binds x,y
-we are going to make EITHER
+mkSelectorBinds is used to desugar a pattern binding {p = e},
+in a binding group:
+  let { ...; p = e; ... } in body
+where p binds x,y (this list of binders can be empty).
+There are two cases.
 
-EITHER (A)   v = e   (where v is fresh)
-             x = case v of p -> x
-             y = case v of p -> y
+------ Special case (A) -------
+  For a pattern that is just a variable,
+     let !x = e in body
+  ==>
+     let x = e in x `seq` body
+  So we return the binding, with 'x' as the variable to seq.
 
-OR (B)       t = case e of p -> (x,y)
-             x = case t of (x,_) -> x
-             y = case t of (_,y) -> y
+------ Special case (B) -------
+  For a pattern that is essentially just a tuple:
+      * A product type, so cannot fail
+      * Only one level, so that
+          - generating multiple matches is fine
+          - seq'ing it evaluates the same as matching it
+  Then instead we generate
+       { v = e
+       ; x = case v of p -> x
+       ; y = case v of p -> y }
+  with 'v' as the variable to force
 
-We do (A) when
- * Matching the pattern is cheap so we don't mind
-   doing it twice.
- * Or if the pattern binds only one variable (so we'll only
-   match once)
- * AND the pattern can't fail (else we tiresomely get two inexhaustive
-   pattern warning messages)
+------ General case (C) -------
+  In the general case we generate these bindings:
+       let { ...; p = e; ... } in body
+  ==>
+       let { t = case e of p -> (x,y)
+           ; x = case t of (x,y) -> x
+           ; y = case t of (x,y) -> y }
+       in t `seq` body
 
-Otherwise we do (B).  Really (A) is just an optimisation for very common
-cases like
-     Just x = e
-     (p,q) = e
+  Note that we return 't' as the variable to force if the pattern
+  is strict (i.e. with -XStrict or an outermost-bang-pattern)
+
+  Note that (A) /includes/ the situation where
+
+   * The pattern binds exactly one variable
+        let !(Just (Just x) = e in body
+     ==>
+       let { t = case e of Just (Just v) -> Unit v
+           ; v = case t of Unit v -> v }
+       in t `seq` body
+    The 'Unit' is a one-tuple; see Note [One-tuples] in TysWiredIn
+    Note that forcing 't' makes the pattern match happen,
+    but does not force 'v'.
+
+  * The pattern binds no variables
+        let !(True,False) = e in body
+    ==>
+        let t = case e of (True,False) -> ()
+        in t `seq` body
+
+
+------ Examples ----------
+  *   !(_, (_, a)) = e
+    ==>
+      t = case e of (_, (_, a)) -> Unit a
+      a = case t of Unit a -> a
+
+    Note that
+     - Forcing 't' will force the pattern to match fully;
+       e.g. will diverge if (snd e) is bottom
+     - But 'a' itself is not forced; it is wrapped in a one-tuple
+       (see Note [One-tuples] in TysWiredIn)
+
+  *   !(Just x) = e
+    ==>
+      t = case e of Just x -> Unit x
+      x = case t of Unit x -> x
+
+    Again, forcing 't' will fail if 'e' yields Nothing.
+
+Note that even though this is rather general, the special cases
+work out well:
+
+* One binder, not -XStrict:
+
+    let Just (Just v) = e in body
+  ==>
+    let t = case e of Just (Just v) -> Unit v
+        v = case t of Unit v -> v
+    in body
+  ==>
+    let v = case (case e of Just (Just v) -> Unit v) of
+              Unit v -> v
+    in body
+  ==>
+    let v = case e of Just (Just v) -> v
+    in body
+
+* Non-recursive, -XStrict
+     let p = e in body
+  ==>
+     let { t = case e of p -> (x,y)
+         ; x = case t of (x,y) -> x
+         ; y = case t of (x,y) -> x }
+     in t `seq` body
+  ==> {inline seq, float x,y bindings inwards}
+     let t = case e of p -> (x,y) in
+     case t of t' ->
+     let { x = case t' of (x,y) -> x
+         ; y = case t' of (x,y) -> x } in
+     body
+  ==> {inline t, do case of case}
+     case e of p ->
+     let t = (x,y) in
+     let { x = case t' of (x,y) -> x
+         ; y = case t' of (x,y) -> x } in
+     body
+  ==> {case-cancellation, drop dead code}
+     case e of p -> body
+
+* Special case (B) is there to avoid fruitlessly taking the tuple
+  apart and rebuilding it. For example, consider
+     { K x y = e }
+  where K is a product constructor.  Then general case (A) does:
+     { t = case e of K x y -> (x,y)
+     ; x = case t of (x,y) -> x
+     ; y = case t of (x,y) -> y }
+  In the lazy case we can't optimise out this fruitless taking apart
+  and rebuilding.  Instead (B) builds
+     { v = e
+     ; x = case v of K x y -> x
+     ; y = case v of K x y -> y }
+  which is better.
 -}
 
-mkSelectorBinds :: [[Tickish Id]] -- ticks to add, possibly
-                -> LPat Id      -- The pattern
-                -> CoreExpr     -- Expression to which the pattern is bound
-                -> DsM [(Id,CoreExpr)]
-
-mkSelectorBinds ticks (L _ (VarPat v)) val_expr
-  = return [(v, case ticks of
-                  [t] -> mkOptTickBox t val_expr
-                  _   -> val_expr)]
+mkSelectorBinds :: [[Tickish Id]] -- ^ ticks to add, possibly
+                -> LPat Id        -- ^ The pattern
+                -> CoreExpr       -- ^ Expression to which the pattern is bound
+                -> DsM (Id,[(Id,CoreExpr)])
+                -- ^ Id the rhs is bound to, for desugaring strict
+                -- binds (see Note [Desugar Strict binds] in DsBinds)
+                -- and all the desugared binds
 
 mkSelectorBinds ticks pat val_expr
-  | null binders
-  = return []
+  | L _ (VarPat (L _ v)) <- pat'     -- Special case (A)
+  = return (v, [(v, val_expr)])
 
-  | isSingleton binders || is_simple_lpat pat
-    -- See Note [mkSelectorBinds]
-  = do { val_var <- newSysLocalDs (hsLPatType pat)
-        -- Make up 'v' in Note [mkSelectorBinds]
-        -- NB: give it the type of *pattern* p, not the type of the *rhs* e.
-        -- This does not matter after desugaring, but there's a subtle
-        -- issue with implicit parameters. Consider
-        --      (x,y) = ?i
-        -- Then, ?i is given type {?i :: Int}, a PredType, which is opaque
-        -- to the desugarer.  (Why opaque?  Because newtypes have to be.  Why
-        -- does it get that type?  So that when we abstract over it we get the
-        -- right top-level type  (?i::Int) => ...)
-        --
-        -- So to get the type of 'v', use the pattern not the rhs.  Often more
-        -- efficient too.
+  | is_flat_prod_lpat pat'           -- Special case (B)
+  = do { let pat_ty = hsLPatType pat'
+       ; val_var <- newSysLocalDs pat_ty
 
-        -- For the error message we make one error-app, to avoid duplication.
-        -- But we need it at different types, so we make it polymorphic:
-        --     err_var = /\a. iRREFUT_PAT_ERR a "blah blah blah"
-       ; err_app <- mkErrorAppDs iRREFUT_PAT_ERROR_ID alphaTy (ppr pat)
-       ; err_var <- newSysLocalDs (mkForAllTy alphaTyVar alphaTy)
-       ; binds   <- zipWithM (mk_bind val_var err_var) ticks' binders
-       ; return ( (val_var, val_expr) :
-                  (err_var, Lam alphaTyVar err_app) :
-                  binds ) }
+       ; let mk_bind tick bndr_var
+               -- (mk_bind sv bv)  generates  bv = case sv of { pat -> bv }
+               -- Remember, 'pat' binds 'bv'
+               = do { rhs_expr <- matchSimply (Var val_var) PatBindRhs pat'
+                                       (Var bndr_var)
+                                       (Var bndr_var)  -- Neat hack
+                      -- Neat hack: since 'pat' can't fail, the
+                      -- "fail-expr" passed to matchSimply is not
+                      -- used. But it /is/ used for its type, and for
+                      -- that bndr_var is just the ticket.
+                    ; return (bndr_var, mkOptTickBox tick rhs_expr) }
 
-  | otherwise
-  = do { error_expr <- mkErrorAppDs iRREFUT_PAT_ERROR_ID   tuple_ty (ppr pat)
-       ; tuple_expr <- matchSimply val_expr PatBindRhs pat local_tuple error_expr
-       ; tuple_var <- newSysLocalDs tuple_ty
+       ; binds <- zipWithM mk_bind ticks' binders
+       ; return ( val_var, (val_var, val_expr) : binds) }
+
+  | otherwise                          -- General case (C)
+  = do { tuple_var  <- newSysLocalDs tuple_ty
+       ; error_expr <- mkErrorAppDs iRREFUT_PAT_ERROR_ID tuple_ty (ppr pat')
+       ; tuple_expr <- matchSimply val_expr PatBindRhs pat
+                                   local_tuple error_expr
        ; let mk_tup_bind tick binder
-              = (binder, mkOptTickBox tick $
-                            mkTupleSelector local_binders binder
-                                            tuple_var (Var tuple_var))
-       ; return ( (tuple_var, tuple_expr) : zipWith mk_tup_bind ticks' binders ) }
+               = (binder, mkOptTickBox tick $
+                          mkTupleSelector1 local_binders binder
+                                           tuple_var (Var tuple_var))
+             tup_binds = zipWith mk_tup_bind ticks' binders
+       ; return (tuple_var, (tuple_var, tuple_expr) : tup_binds) }
   where
-    binders       = collectPatBinders pat
-    ticks'        = ticks ++ repeat []
+    pat' = strip_bangs pat
+           -- Strip the bangs before looking for case (A) or (B)
+           -- The incoming pattern may well have a bang on it
+
+    binders = collectPatBinders pat'
+    ticks'  = ticks ++ repeat []
 
     local_binders = map localiseId binders      -- See Note [Localise pattern binders]
-    local_tuple   = mkBigCoreVarTup binders
+    local_tuple   = mkBigCoreVarTup1 binders
     tuple_ty      = exprType local_tuple
 
-    mk_bind scrut_var err_var tick bndr_var = do
-    -- (mk_bind sv err_var) generates
-    --          bv = case sv of { pat -> bv; other -> err_var @ type-of-bv }
-    -- Remember, pat binds bv
-        rhs_expr <- matchSimply (Var scrut_var) PatBindRhs pat
-                                (Var bndr_var) error_expr
-        return (bndr_var, mkOptTickBox tick rhs_expr)
-      where
-        error_expr = Var err_var `App` Type (idType bndr_var)
+strip_bangs :: LPat a -> LPat a
+-- Remove outermost bangs and parens
+strip_bangs (L _ (ParPat p))  = strip_bangs p
+strip_bangs (L _ (BangPat p)) = strip_bangs p
+strip_bangs lp                = lp
 
-    is_simple_lpat p = is_simple_pat (unLoc p)
+is_flat_prod_lpat :: LPat a -> Bool
+is_flat_prod_lpat p = is_flat_prod_pat (unLoc p)
 
-    is_simple_pat (TuplePat ps Boxed _) = all is_triv_lpat ps
-    is_simple_pat pat@(ConPatOut{})     = case unLoc (pat_con pat) of
-        RealDataCon con -> isProductTyCon (dataConTyCon con)
-                           && all is_triv_lpat (hsConPatArgs (pat_args pat))
-        PatSynCon _     -> False
-    is_simple_pat (VarPat _)                   = True
-    is_simple_pat (ParPat p)                   = is_simple_lpat p
-    is_simple_pat _                                    = False
+is_flat_prod_pat :: Pat a -> Bool
+is_flat_prod_pat (ParPat p)            = is_flat_prod_lpat p
+is_flat_prod_pat (TuplePat ps Boxed _) = all is_triv_lpat ps
+is_flat_prod_pat (ConPatOut { pat_con = L _ pcon, pat_args = ps})
+  | RealDataCon con <- pcon
+  , isProductTyCon (dataConTyCon con)
+  = all is_triv_lpat (hsConPatArgs ps)
+is_flat_prod_pat _ = False
 
-    is_triv_lpat p = is_triv_pat (unLoc p)
+is_triv_lpat :: LPat a -> Bool
+is_triv_lpat p = is_triv_pat (unLoc p)
 
-    is_triv_pat (VarPat _)  = True
-    is_triv_pat (WildPat _) = True
-    is_triv_pat (ParPat p)  = is_triv_lpat p
-    is_triv_pat _           = False
+is_triv_pat :: Pat a -> Bool
+is_triv_pat (VarPat _)  = True
+is_triv_pat (WildPat _) = True
+is_triv_pat (ParPat p)  = is_triv_lpat p
+is_triv_pat _           = False
 
-{-
-Creating big tuples and their types for full Haskell expressions.
-They work over *Ids*, and create tuples replete with their types,
-which is whey they are not in HsUtils.
--}
+
+{- *********************************************************************
+*                                                                      *
+  Creating big tuples and their types for full Haskell expressions.
+  They work over *Ids*, and create tuples replete with their types,
+  which is whey they are not in HsUtils.
+*                                                                      *
+********************************************************************* -}
 
 mkLHsPatTup :: [LPat Id] -> LPat Id
 mkLHsPatTup []     = noLoc $ mkVanillaTuplePat [] Boxed
@@ -717,23 +825,23 @@ mkVanillaTuplePat :: [OutPat Id] -> Boxity -> Pat Id
 mkVanillaTuplePat pats box = TuplePat pats box (map hsLPatType pats)
 
 -- The Big equivalents for the source tuple expressions
-mkBigLHsVarTup :: [Id] -> LHsExpr Id
-mkBigLHsVarTup ids = mkBigLHsTup (map nlHsVar ids)
+mkBigLHsVarTupId :: [Id] -> LHsExpr Id
+mkBigLHsVarTupId ids = mkBigLHsTupId (map nlHsVar ids)
 
-mkBigLHsTup :: [LHsExpr Id] -> LHsExpr Id
-mkBigLHsTup = mkChunkified mkLHsTupleExpr
+mkBigLHsTupId :: [LHsExpr Id] -> LHsExpr Id
+mkBigLHsTupId = mkChunkified mkLHsTupleExpr
 
 -- The Big equivalents for the source tuple patterns
-mkBigLHsVarPatTup :: [Id] -> LPat Id
-mkBigLHsVarPatTup bs = mkBigLHsPatTup (map nlVarPat bs)
+mkBigLHsVarPatTupId :: [Id] -> LPat Id
+mkBigLHsVarPatTupId bs = mkBigLHsPatTupId (map nlVarPat bs)
 
-mkBigLHsPatTup :: [LPat Id] -> LPat Id
-mkBigLHsPatTup = mkChunkified mkLHsPatTup
+mkBigLHsPatTupId :: [LPat Id] -> LPat Id
+mkBigLHsPatTupId = mkChunkified mkLHsPatTup
 
 {-
 ************************************************************************
 *                                                                      *
-\subsection[mkFailurePair]{Code for pattern-matching and other failures}
+        Code for pattern-matching and other failures
 *                                                                      *
 ************************************************************************
 
@@ -818,7 +926,13 @@ entered at most once.  Adding a dummy 'realWorld' token argument makes
 it clear that sharing is not an issue.  And that in turn makes it more
 CPR-friendly.  This matters a lot: if you don't get it right, you lose
 the tail call property.  For example, see Trac #3403.
--}
+
+
+************************************************************************
+*                                                                      *
+              Ticks
+*                                                                      *
+********************************************************************* -}
 
 mkOptTickBox :: [Tickish Id] -> CoreExpr -> CoreExpr
 mkOptTickBox = flip (foldr Tick)
@@ -836,3 +950,30 @@ mkBinaryTickBox ixT ixF e = do
                        [ (DataAlt falseDataCon, [], falseBox)
                        , (DataAlt trueDataCon,  [], trueBox)
                        ]
+
+
+
+-- *******************************************************************
+
+-- | Use -XStrict to add a ! or remove a ~
+--
+-- Examples:
+-- ~pat    => pat    -- when -XStrict (even if pat = ~pat')
+-- !pat    => !pat   -- always
+-- pat     => !pat   -- when -XStrict
+-- pat     => pat    -- otherwise
+decideBangHood :: DynFlags
+               -> LPat id  -- ^ Original pattern
+               -> LPat id  -- Pattern with bang if necessary
+decideBangHood dflags lpat
+  | not (xopt LangExt.Strict dflags)
+  = lpat
+  | otherwise   --  -XStrict
+  = go lpat
+  where
+    go lp@(L l p)
+      = case p of
+           ParPat p    -> L l (ParPat (go p))
+           LazyPat lp' -> lp'
+           BangPat _   -> lp
+           _           -> L l (BangPat lp)

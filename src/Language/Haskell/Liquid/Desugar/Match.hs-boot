@@ -1,4 +1,4 @@
-module Language.Haskell.Liquid.Desugar.Match where
+module Match where
 import Var      ( Id )
 import TcType   ( Type )
 import DsMonad  ( DsM, EquationInfo, MatchResult )
@@ -13,6 +13,7 @@ match   :: [Id]
 
 matchWrapper
         :: HsMatchContext Name
+        -> Maybe (LHsExpr Id)
         -> MatchGroup Id (LHsExpr Id)
         -> DsM ([Id], CoreExpr)
 

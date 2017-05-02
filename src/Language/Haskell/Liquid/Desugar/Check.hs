@@ -1,774 +1,1415 @@
 {-
-(c) The University of Glasgow 2006
-(c) The GRASP/AQUA Project, Glasgow University, 1997-1998
+Author: George Karachalias <george.karachalias@cs.kuleuven.be>
 
-Author: Juan J. Quintela    <quintela@krilin.dc.fi.udc.es>
+Pattern Matching Coverage Checking.
 -}
 
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP, GADTs, DataKinds, KindSignatures #-}
 
-module Language.Haskell.Liquid.Desugar.Check ( check , ExhaustivePat ) where
+module Check (
+        -- Checking and printing
+        checkSingle, checkMatches, isAnyPmCheckEnabled,
 
--- #include "HsVersions.h"
+        -- See Note [Type and Term Equality Propagation]
+        genCaseTmCs1, genCaseTmCs2
+    ) where
 
-import Prelude hiding (error)
+#include "HsVersions.h"
+
+import TmOracle
+
+import DynFlags
 import HsSyn
 import TcHsSyn
-import Language.Haskell.Liquid.Desugar.DsUtils
-import Language.Haskell.Liquid.Desugar.MatchLit
 import Id
 import ConLike
 import DataCon
-import PatSyn
 import Name
+import FamInstEnv
 import TysWiredIn
-import PrelNames
 import TyCon
 import SrcLoc
-import UniqSet
 import Util
-import BasicTypes
 import Outputable
 import FastString
 
-{-
-This module performs checks about if one list of equations are:
-\begin{itemize}
-\item Overlapped
-\item Non exhaustive
-\end{itemize}
-To discover that we go through the list of equations in a tree-like fashion.
+import DsMonad    -- DsM, initTcDsForSolver, getDictsDs
+import TcSimplify -- tcCheckSatisfiability
+import TcType     -- toTcType, toTcTypeBag
+import Bag
+import ErrUtils
+import MonadUtils -- MonadIO
+import Var        -- EvVar
+import Type
+import UniqSupply
+import DsGRHSs    -- isTrueLHsExpr
 
-If you like theory, a similar algorithm is described in:
-\begin{quotation}
-        {\em Two Techniques for Compiling Lazy Pattern Matching},
-        Luc Maranguet,
-        INRIA Rocquencourt (RR-2385, 1994)
-\end{quotation}
-The algorithm is based on the first technique, but there are some differences:
-\begin{itemize}
-\item We don't generate code
-\item We have constructors and literals (not only literals as in the
-          article)
-\item We don't use directions, we must select the columns from
-          left-to-right
-\end{itemize}
-(By the way the second technique is really similar to the one used in
- @Match.lhs@ to generate code)
-
-This function takes the equations of a pattern and returns:
-\begin{itemize}
-\item The patterns that are not recognized
-\item The equations that are not overlapped
-\end{itemize}
-It simplify the patterns and then call @check'@ (the same semantics), and it
-needs to reconstruct the patterns again ....
-
-The problem appear with things like:
-\begin{verbatim}
-  f [x,y]   = ....
-  f (x:xs)  = .....
-\end{verbatim}
-We want to put the two patterns with the same syntax, (prefix form) and
-then all the constructors are equal:
-\begin{verbatim}
-  f (: x (: y []))   = ....
-  f (: x xs)         = .....
-\end{verbatim}
-(more about that in @tidy_eqns@)
-
-We would prefer to have a @WarningPat@ of type @String@, but Strings and the
-Pretty Printer are not friends.
-
-We use @InPat@ in @WarningPat@ instead of @OutPat@
-because we need to print the
-warning messages in the same way they are introduced, i.e. if the user
-wrote:
-\begin{verbatim}
-        f [x,y] = ..
-\end{verbatim}
-He don't want a warning message written:
-\begin{verbatim}
-        f (: x (: y [])) ........
-\end{verbatim}
-Then we need to use InPats.
-\begin{quotation}
-     Juan Quintela 5 JUL 1998\\
-          User-friendliness and compiler writers are no friends.
-\end{quotation}
--}
-
-type WarningPat = InPat Name
-type ExhaustivePat = ([WarningPat], [(Name, [HsLit])])
-type EqnNo  = Int
-type EqnSet = UniqSet EqnNo
-
-
-check :: [EquationInfo] -> ([ExhaustivePat], [EquationInfo])
-  -- Second result is the shadowed equations
-  -- if there are view patterns, just give up - don't know what the function is
-check qs = (untidy_warns, shadowed_eqns)
-      where
-        tidy_qs = map tidy_eqn qs
-        (warns, used_nos) = check' ([1..] `zip` tidy_qs)
-        untidy_warns = map untidy_exhaustive warns
-        shadowed_eqns = [eqn | (eqn,i) <- qs `zip` [1..],
-                                not (i `elementOfUniqSet` used_nos)]
-
-untidy_exhaustive :: ExhaustivePat -> ExhaustivePat
-untidy_exhaustive ([pat], messages) =
-                  ([untidy_no_pars pat], map untidy_message messages)
-untidy_exhaustive (pats, messages) =
-                  (map untidy_pars pats, map untidy_message messages)
-
-untidy_message :: (Name, [HsLit]) -> (Name, [HsLit])
-untidy_message (string, lits) = (string, map untidy_lit lits)
-
--- The function @untidy@ does the reverse work of the @tidy_pat@ function.
-
-type NeedPars = Bool
-
-untidy_no_pars :: WarningPat -> WarningPat
-untidy_no_pars p = untidy False p
-
-untidy_pars :: WarningPat -> WarningPat
-untidy_pars p = untidy True p
-
-untidy :: NeedPars -> WarningPat -> WarningPat
-untidy b (L loc p) = L loc (untidy' b p)
-  where
-    untidy' _ p@(WildPat _)          = p
-    untidy' _ p@(VarPat _)           = p
-    untidy' _ (LitPat lit)           = LitPat (untidy_lit lit)
-    untidy' _ p@(ConPatIn _ (PrefixCon [])) = p
-    untidy' b (ConPatIn name ps)     = pars b (L loc (ConPatIn name (untidy_con ps)))
-    untidy' _ (ListPat pats ty Nothing)     = ListPat (map untidy_no_pars pats) ty Nothing
-    untidy' _ (TuplePat pats box tys) = TuplePat (map untidy_no_pars pats) box tys
-    untidy' _ (ListPat _ _ (Just _)) = panic "Check.untidy: Overloaded ListPat"
-    untidy' _ (PArrPat _ _)          = panic "Check.untidy: Shouldn't get a parallel array here!"
-    untidy' _ (SigPatIn _ _)         = panic "Check.untidy: SigPat"
-    untidy' _ (LazyPat {})           = panic "Check.untidy: LazyPat"
-    untidy' _ (AsPat {})             = panic "Check.untidy: AsPat"
-    untidy' _ (ParPat {})            = panic "Check.untidy: ParPat"
-    untidy' _ (BangPat {})           = panic "Check.untidy: BangPat"
-    untidy' _ (ConPatOut {})         = panic "Check.untidy: ConPatOut"
-    untidy' _ (ViewPat {})           = panic "Check.untidy: ViewPat"
-    untidy' _ (SplicePat {})         = panic "Check.untidy: SplicePat"
-    untidy' _ (QuasiQuotePat {})     = panic "Check.untidy: QuasiQuotePat"
-    untidy' _ (NPat {})              = panic "Check.untidy: NPat"
-    untidy' _ (NPlusKPat {})         = panic "Check.untidy: NPlusKPat"
-    untidy' _ (SigPatOut {})         = panic "Check.untidy: SigPatOut"
-    untidy' _ (CoPat {})             = panic "Check.untidy: CoPat"
-
-untidy_con :: HsConPatDetails Name -> HsConPatDetails Name
-untidy_con (PrefixCon pats) = PrefixCon (map untidy_pars pats)
-untidy_con (InfixCon p1 p2) = InfixCon  (untidy_pars p1) (untidy_pars p2)
-untidy_con (RecCon (HsRecFields flds dd))
-  = RecCon (HsRecFields [ L l (fld { hsRecFieldArg
-                                            = untidy_pars (hsRecFieldArg fld) })
-                        | L l fld <- flds ] dd)
-
-pars :: NeedPars -> WarningPat -> Pat Name
-pars True p = ParPat p
-pars _    p = unLoc p
-
-untidy_lit :: HsLit -> HsLit
-untidy_lit (HsCharPrim src c) = HsChar src c
-untidy_lit lit                = lit
+import Data.List     -- find
+import Data.Maybe    -- isNothing, isJust, fromJust
+import Control.Monad -- liftM3, forM
+import Coercion
+import TcEvidence
+import IOEnv
 
 {-
-This equation is the same that check, the only difference is that the
-boring work is done, that work needs to be done only once, this is
-the reason top have two functions, check is the external interface,
-@check'@ is called recursively.
+This module checks pattern matches for:
+\begin{enumerate}
+  \item Equations that are redundant
+  \item Equations with inaccessible right-hand-side
+  \item Exhaustiveness
+\end{enumerate}
 
-There are several cases:
+The algorithm is based on the paper:
 
-\begin{itemize}
-\item There are no equations: Everything is OK.
-\item There are only one equation, that can fail, and all the patterns are
-      variables. Then that equation is used and the same equation is
-      non-exhaustive.
-\item All the patterns are variables, and the match can fail, there are
-      more equations then the results is the result of the rest of equations
-      and this equation is used also.
+  "GADTs Meet Their Match:
+     Pattern-matching Warnings That Account for GADTs, Guards, and Laziness"
 
-\item The general case, if all the patterns are variables (here the match
-      can't fail) then the result is that this equation is used and this
-      equation doesn't generate non-exhaustive cases.
+    http://people.cs.kuleuven.be/~george.karachalias/papers/p424-karachalias.pdf
 
-\item In the general case, there can exist literals ,constructors or only
-      vars in the first column, we actuate in consequence.
-
-\end{itemize}
+%************************************************************************
+%*                                                                      *
+                     Pattern Match Check Types
+%*                                                                      *
+%************************************************************************
 -}
 
-check' :: [(EqnNo, EquationInfo)]
-        -> ([ExhaustivePat],    -- Pattern scheme that might not be matched at all
-            EqnSet)             -- Eqns that are used (others are overlapped)
-
-check' [] = ([],emptyUniqSet)
-  -- Was    ([([],[])], emptyUniqSet)
-  -- But that (a) seems weird, and (b) triggered Trac #7669
-  -- So now I'm just doing the simple obvious thing
-
-check' ((n, EqnInfo { eqn_pats = ps, eqn_rhs = MatchResult can_fail _ }) : rs)
-   | first_eqn_all_vars && case can_fail of { CantFail -> True; CanFail -> False }
-   = ([], unitUniqSet n)        -- One eqn, which can't fail
-
-   | first_eqn_all_vars && null rs      -- One eqn, but it can fail
-   = ([(takeList ps (repeat nlWildPatName),[])], unitUniqSet n)
-
-   | first_eqn_all_vars         -- Several eqns, first can fail
-   = (pats, addOneToUniqSet indexs n)
-  where
-    first_eqn_all_vars = all_vars ps
-    (pats,indexs) = check' rs
-
-check' qs
-   | some_literals     = split_by_literals qs
-   | some_constructors = split_by_constructor qs
-   | only_vars         = first_column_only_vars qs
-   | otherwise = pprPanic "Check.check': Not implemented :-(" (ppr first_pats)
-                 -- Shouldn't happen
-  where
-     -- Note: RecPats will have been simplified to ConPats
-     --       at this stage.
-    first_pats        = {- ASSERT2( okGroup qs, pprGroup qs ) -} map firstPatN qs
-    some_constructors = any is_con first_pats
-    some_literals     = any is_lit first_pats
-    only_vars         = all is_var first_pats
-
-{-
-Here begins the code to deal with literals, we need to split the matrix
-in different matrix beginning by each literal and a last matrix with the
-rest of values.
--}
-
-split_by_literals :: [(EqnNo, EquationInfo)] -> ([ExhaustivePat], EqnSet)
-split_by_literals qs = process_literals used_lits qs
-           where
-             used_lits = get_used_lits qs
-
-{-
-@process_explicit_literals@ is a function that process each literal that appears
-in the column of the matrix.
--}
-
-process_explicit_literals :: [HsLit] -> [(EqnNo, EquationInfo)] -> ([ExhaustivePat],EqnSet)
-process_explicit_literals lits qs = (concat pats, unionManyUniqSets indexs)
-    where
-      pats_indexs   = map (\x -> construct_literal_matrix x qs) lits
-      (pats,indexs) = unzip pats_indexs
-
-{-
-@process_literals@ calls @process_explicit_literals@ to deal with the literals
-that appears in the matrix and deal also with the rest of the cases. It
-must be one Variable to be complete.
--}
-
-process_literals :: [HsLit] -> [(EqnNo, EquationInfo)] -> ([ExhaustivePat],EqnSet)
-process_literals used_lits qs
-  | null default_eqns  = {- ASSERT( not (null qs) ) -} ([make_row_vars used_lits (head qs)] ++ pats,indexs)
-  | otherwise          = (pats_default,indexs_default)
-     where
-       (pats,indexs)   = process_explicit_literals used_lits qs
-       default_eqns    = -- ASSERT2( okGroup qs, pprGroup qs )
-                         [remove_var q | q <- qs, is_var (firstPatN q)]
-       (pats',indexs') = check' default_eqns
-       pats_default    = [(nlWildPatName:ps,constraints) |
-                                        (ps,constraints) <- (pats')] ++ pats
-       indexs_default  = unionUniqSets indexs' indexs
-
-{-
-Here we have selected the literal and we will select all the equations that
-begins for that literal and create a new matrix.
--}
-
-construct_literal_matrix :: HsLit -> [(EqnNo, EquationInfo)] -> ([ExhaustivePat],EqnSet)
-construct_literal_matrix lit qs =
-    (map (\ (xs,ys) -> (new_lit:xs,ys)) pats,indexs)
-  where
-    (pats,indexs) = (check' (remove_first_column_lit lit qs))
-    new_lit = nlLitPat lit
-
-remove_first_column_lit :: HsLit
-                        -> [(EqnNo, EquationInfo)]
-                        -> [(EqnNo, EquationInfo)]
-remove_first_column_lit lit qs
-  = -- ASSERT2( okGroup qs, pprGroup qs )
-    [(n, shift_pat eqn) | q@(n,eqn) <- qs, is_var_lit lit (firstPatN q)]
-  where
-     shift_pat eqn@(EqnInfo { eqn_pats = _:ps}) = eqn { eqn_pats = ps }
-     shift_pat _                                = panic "Check.shift_var: no patterns"
-
-{-
-This function splits the equations @qs@ in groups that deal with the
-same constructor.
--}
-
-split_by_constructor :: [(EqnNo, EquationInfo)] -> ([ExhaustivePat], EqnSet)
-split_by_constructor qs
-  | null used_cons      = ([], mkUniqSet $ map fst qs)
-  | notNull unused_cons = need_default_case used_cons unused_cons qs
-  | otherwise           = no_need_default_case used_cons qs
-                       where
-                          used_cons   = get_used_cons qs
-                          unused_cons = get_unused_cons used_cons
-
-{-
-The first column of the patterns matrix only have vars, then there is
-nothing to do.
--}
-
-first_column_only_vars :: [(EqnNo, EquationInfo)] -> ([ExhaustivePat],EqnSet)
-first_column_only_vars qs
-  = (map (\ (xs,ys) -> (nlWildPatName:xs,ys)) pats,indexs)
-  where
-    (pats, indexs) = check' (map remove_var qs)
-
-{-
-This equation takes a matrix of patterns and split the equations by
-constructor, using all the constructors that appears in the first column
-of the pattern matching.
-
-We can need a default clause or not ...., it depends if we used all the
-constructors or not explicitly. The reasoning is similar to @process_literals@,
-the difference is that here the default case is not always needed.
--}
-
-no_need_default_case :: [Pat Id] -> [(EqnNo, EquationInfo)] -> ([ExhaustivePat],EqnSet)
-no_need_default_case cons qs = (concat pats, unionManyUniqSets indexs)
-    where
-      pats_indexs   = map (\x -> construct_matrix x qs) cons
-      (pats,indexs) = unzip pats_indexs
-
-need_default_case :: [Pat Id] -> [DataCon] -> [(EqnNo, EquationInfo)] -> ([ExhaustivePat],EqnSet)
-need_default_case used_cons unused_cons qs
-  | null default_eqns  = (pats_default_no_eqns,indexs)
-  | otherwise          = (pats_default,indexs_default)
-     where
-       (pats,indexs)   = no_need_default_case used_cons qs
-       default_eqns    = -- ASSERT2( okGroup qs, pprGroup qs )
-                         [remove_var q | q <- qs, is_var (firstPatN q)]
-       (pats',indexs') = check' default_eqns
-       pats_default    = [(make_whole_con c:ps,constraints) |
-                          c <- unused_cons, (ps,constraints) <- pats'] ++ pats
-       new_wilds       = {- ASSERT( not (null qs) ) -} make_row_vars_for_constructor (head qs)
-       pats_default_no_eqns =  [(make_whole_con c:new_wilds,[]) | c <- unused_cons] ++ pats
-       indexs_default  = unionUniqSets indexs' indexs
-
-construct_matrix :: Pat Id -> [(EqnNo, EquationInfo)] -> ([ExhaustivePat],EqnSet)
-construct_matrix con qs =
-    (map (make_con con) pats,indexs)
-  where
-    (pats,indexs) = (check' (remove_first_column con qs))
-
-{-
-Here remove first column is more difficult that with literals due to the fact
-that constructors can have arguments.
-
-For instance, the matrix
-\begin{verbatim}
- (: x xs) y
- z        y
-\end{verbatim}
-is transformed in:
-\begin{verbatim}
- x xs y
- _ _  y
-\end{verbatim}
--}
-
-remove_first_column :: Pat Id                -- Constructor
-                    -> [(EqnNo, EquationInfo)]
-                    -> [(EqnNo, EquationInfo)]
-remove_first_column (ConPatOut{ pat_con = L _ con, pat_args = PrefixCon con_pats }) qs
-  = --  ASSERT2( okGroup qs, pprGroup qs )
-    [(n, shift_var eqn) | q@(n, eqn) <- qs, is_var_con con (firstPatN q)]
-  where
-     new_wilds = [WildPat (hsLPatType arg_pat) | arg_pat <- con_pats]
-     shift_var eqn@(EqnInfo { eqn_pats = ConPatOut{ pat_args = PrefixCon ps' } : ps})
-        = eqn { eqn_pats = map unLoc ps' ++ ps }
-     shift_var eqn@(EqnInfo { eqn_pats = WildPat _ : ps })
-        = eqn { eqn_pats = new_wilds ++ ps }
-     shift_var _ = panic "Check.Shift_var:No done"
-remove_first_column _ _ = panic "Check.remove_first_column: Not ConPatOut"
-
-make_row_vars :: [HsLit] -> (EqnNo, EquationInfo) -> ExhaustivePat
-make_row_vars used_lits (_, EqnInfo { eqn_pats = pats})
-   = (nlVarPat new_var:takeList (tail pats) (repeat nlWildPatName)
-     ,[(new_var,used_lits)])
-  where
-     new_var = hash_x
-
-hash_x :: Name
-hash_x = mkInternalName unboundKey {- doesn't matter much -}
-                     (mkVarOccFS (fsLit "#x"))
-                     noSrcSpan
-
-make_row_vars_for_constructor :: (EqnNo, EquationInfo) -> [WarningPat]
-make_row_vars_for_constructor (_, EqnInfo { eqn_pats = pats})
-  = takeList (tail pats) (repeat nlWildPatName)
-
-compare_cons :: Pat Id -> Pat Id -> Bool
-compare_cons (ConPatOut{ pat_con = L _ con1 }) (ConPatOut{ pat_con = L _ con2 })
-  = case (con1, con2) of
-    (RealDataCon id1, RealDataCon id2) -> id1 == id2
-    _ -> False
-compare_cons _ _ = panic "Check.compare_cons: Not ConPatOut with RealDataCon"
-
-remove_dups :: [Pat Id] -> [Pat Id]
-remove_dups []     = []
-remove_dups (x:xs) | any (\y -> compare_cons x y) xs = remove_dups  xs
-                   | otherwise                       = x : remove_dups xs
-
-get_used_cons :: [(EqnNo, EquationInfo)] -> [Pat Id]
-get_used_cons qs = remove_dups [pat | q <- qs, let pat = firstPatN q,
-                                      isConPatOut pat]
-
-isConPatOut :: Pat Id -> Bool
-isConPatOut ConPatOut{ pat_con = L _ RealDataCon{} } = True
-isConPatOut _                                        = False
-
-remove_dups' :: [HsLit] -> [HsLit]
-remove_dups' []                   = []
-remove_dups' (x:xs) | x `elem` xs = remove_dups' xs
-                    | otherwise   = x : remove_dups' xs
-
-
-get_used_lits :: [(EqnNo, EquationInfo)] -> [HsLit]
-get_used_lits qs = remove_dups' all_literals
-                 where
-                   all_literals = get_used_lits' qs
-
-get_used_lits' :: [(EqnNo, EquationInfo)] -> [HsLit]
-get_used_lits' [] = []
-get_used_lits' (q:qs)
-  | Just lit <- get_lit (firstPatN q) = lit : get_used_lits' qs
-  | otherwise                         = get_used_lits qs
-
-get_lit :: Pat id -> Maybe HsLit
--- Get a representative HsLit to stand for the OverLit
--- It doesn't matter which one, because they will only be compared
--- with other HsLits gotten in the same way
-get_lit (LitPat lit)                                      = Just lit
-get_lit (NPat (L _ (OverLit { ol_val = HsIntegral src i}))    mb _)
-                        = Just (HsIntPrim src (mb_neg negate              mb i))
-get_lit (NPat (L _ (OverLit { ol_val = HsFractional f })) mb _)
-                        = Just (HsFloatPrim (mb_neg negateFractionalLit mb f))
-get_lit (NPat (L _ (OverLit { ol_val = HsIsString src s }))   _  _)
-                        = Just (HsStringPrim src (fastStringToByteString s))
-get_lit _                                                 = Nothing
-
-mb_neg :: (a -> a) -> Maybe b -> a -> a
-mb_neg _      Nothing  v = v
-mb_neg negate (Just _) v = negate v
-
-get_unused_cons :: [Pat Id] -> [DataCon]
-get_unused_cons used_cons = {- ASSERT( not (null used_cons) ) -} unused_cons
-     where
-       used_set :: UniqSet DataCon
-       used_set = mkUniqSet [d | ConPatOut{ pat_con = L _ (RealDataCon d) } <- used_cons]
-       (ConPatOut { pat_con = L _ (RealDataCon con1), pat_arg_tys = inst_tys }) = head used_cons
-       ty_con      = dataConTyCon con1
-       unused_cons = filterOut is_used (tyConDataCons ty_con)
-       is_used con = con `elementOfUniqSet` used_set
-                     || dataConCannotMatch inst_tys con
-
-all_vars :: [Pat Id] -> Bool
-all_vars []             = True
-all_vars (WildPat _:ps) = all_vars ps
-all_vars _              = False
-
-remove_var :: (EqnNo, EquationInfo) -> (EqnNo, EquationInfo)
-remove_var (n, eqn@(EqnInfo { eqn_pats = WildPat _ : ps})) = (n, eqn { eqn_pats = ps })
-remove_var _  = panic "Check.remove_var: equation does not begin with a variable"
-
------------------------
-{-
-eqnPats :: (EqnNo, EquationInfo) -> [Pat Id]
-eqnPats (_, eqn) = eqn_pats eqn
-okGroup :: [(EqnNo, EquationInfo)] -> Bool
--- True if all equations have at least one pattern, and
--- all have the same number of patterns
-okGroup [] = True
-okGroup (e:es) = n_pats > 0 && and [length (eqnPats e) == n_pats | e <- es]
-               where
-                 n_pats = length (eqnPats e)
--}
--- Half-baked print
--- pprGroup :: [(EqnNo, EquationInfo)] -> SDoc
--- pprEqnInfo :: (EqnNo, EquationInfo) -> SDoc
--- pprGroup es = vcat (map pprEqnInfo es)
--- pprEqnInfo e = ppr (eqnPats e)
-
-
-firstPatN :: (EqnNo, EquationInfo) -> Pat Id
-firstPatN (_, eqn) = firstPat eqn
-
-is_con :: Pat Id -> Bool
-is_con (ConPatOut {}) = True
-is_con _              = False
-
-is_lit :: Pat Id -> Bool
-is_lit (LitPat _)      = True
-is_lit (NPat _ _ _)  = True
-is_lit _               = False
-
-is_var :: Pat Id -> Bool
-is_var (WildPat _) = True
-is_var _           = False
-
-is_var_con :: ConLike -> Pat Id -> Bool
-is_var_con _   (WildPat _)                     = True
-is_var_con con (ConPatOut{ pat_con = L _ id }) = id == con
-is_var_con _   _                               = False
-
-is_var_lit :: HsLit -> Pat Id -> Bool
-is_var_lit _   (WildPat _)   = True
-is_var_lit lit pat
-  | Just lit' <- get_lit pat = lit == lit'
-  | otherwise                = False
-
-{-
-The difference beteewn @make_con@ and @make_whole_con@ is that
-@make_wole_con@ creates a new constructor with all their arguments, and
-@make_con@ takes a list of argumntes, creates the contructor getting their
-arguments from the list. See where \fbox{\ ???\ } are used for details.
-
-We need to reconstruct the patterns (make the constructors infix and
-similar) at the same time that we create the constructors.
-
-You can tell tuple constructors using
-\begin{verbatim}
-        Id.isTupleDataCon
-\end{verbatim}
-You can see if one constructor is infix with this clearer code :-))))))))))
-\begin{verbatim}
-        Lex.isLexConSym (Name.occNameString (Name.getOccName con))
-\end{verbatim}
-
-       Rather clumsy but it works. (Simon Peyton Jones)
-
-
-We don't mind the @nilDataCon@ because it doesn't change the way to
-print the message, we are searching only for things like: @[1,2,3]@,
-not @x:xs@ ....
-
-In @reconstruct_pat@ we want to ``undo'' the work
-that we have done in @tidy_pat@.
-In particular:
-\begin{tabular}{lll}
-        @((,) x y)@   & returns to be & @(x, y)@
-\\      @((:) x xs)@  & returns to be & @(x:xs)@
-\\      @(x:(...:[])@ & returns to be & @[x,...]@
-\end{tabular}
-
-The difficult case is the third one becouse we need to follow all the
-contructors until the @[]@ to know that we need to use the second case,
-not the second. \fbox{\ ???\ }
--}
-
-isInfixCon :: DataCon -> Bool
-isInfixCon con = isDataSymOcc (getOccName con)
-
-is_nil :: Pat Name -> Bool
-is_nil (ConPatIn con (PrefixCon [])) = unLoc con == getName nilDataCon
-is_nil _                             = False
-
-is_list :: Pat Name -> Bool
-is_list (ListPat _ _ Nothing) = True
-is_list _             = False
-
-return_list :: DataCon -> Pat Name -> Bool
-return_list id q = id == consDataCon && (is_nil q || is_list q)
-
-make_list :: LPat Name -> Pat Name -> Pat Name
-make_list p q | is_nil q    = ListPat [p] placeHolderType Nothing
-make_list p (ListPat ps ty Nothing) = ListPat (p:ps) ty Nothing
-make_list _ _               = panic "Check.make_list: Invalid argument"
-
-make_con :: Pat Id -> ExhaustivePat -> ExhaustivePat
-make_con (ConPatOut{ pat_con = L _ (RealDataCon id) }) (lp:lq:ps, constraints)
-     | return_list id q = (noLoc (make_list lp q) : ps, constraints)
-     | isInfixCon id    = (nlInfixConPat (getName id) lp lq : ps, constraints)
-   where q  = unLoc lq
-
-make_con (ConPatOut{ pat_con = L _ (RealDataCon id), pat_args = PrefixCon pats})
-         (ps, constraints)
-      | isTupleTyCon tc  = (noLoc (TuplePat pats_con (tupleTyConBoxity tc) [])
-                                : rest_pats, constraints)
-      | isPArrFakeCon id = (noLoc (PArrPat pats_con placeHolderType)
-                                : rest_pats, constraints)
-      | otherwise        = (nlConPatName name pats_con
-                                : rest_pats, constraints)
-    where
-        name                  = getName id
-        (pats_con, rest_pats) = splitAtList pats ps
-        tc                    = dataConTyCon id
-
-make_con _ _ = panic "Check.make_con: Not ConPatOut"
-
--- reconstruct parallel array pattern
+type PmM a = DsM a
+
+data PatTy = PAT | VA -- Used only as a kind, to index PmPat
+
+-- The *arity* of a PatVec [p1,..,pn] is
+-- the number of p1..pn that are not Guards
+
+data PmPat :: PatTy -> * where
+  PmCon  :: { pm_con_con     :: DataCon
+            , pm_con_arg_tys :: [Type]
+            , pm_con_tvs     :: [TyVar]
+            , pm_con_dicts   :: [EvVar]
+            , pm_con_args    :: [PmPat t] } -> PmPat t
+            -- For PmCon arguments' meaning see @ConPatOut@ in hsSyn/HsPat.hs
+  PmVar  :: { pm_var_id   :: Id    } -> PmPat t
+  PmLit  :: { pm_lit_lit  :: PmLit } -> PmPat t -- See Note [Literals in PmPat]
+  PmNLit :: { pm_lit_id   :: Id
+            , pm_lit_not  :: [PmLit] } -> PmPat 'VA
+  PmGrd  :: { pm_grd_pv   :: PatVec
+            , pm_grd_expr :: PmExpr  } -> PmPat 'PAT
+
+-- data T a where
+--     MkT :: forall p q. (Eq p, Ord q) => p -> q -> T [p]
+-- or  MkT :: forall p q r. (Eq p, Ord q, [p] ~ r) => p -> q -> T r
+
+type Pattern = PmPat 'PAT -- ^ Patterns
+type ValAbs  = PmPat 'VA  -- ^ Value Abstractions
+
+type PatVec = [Pattern]             -- ^ Pattern Vectors
+data ValVec = ValVec [ValAbs] Delta -- ^ Value Vector Abstractions
+
+-- | Term and type constraints to accompany each value vector abstraction.
+-- For efficiency, we store the term oracle state instead of the term
+-- constraints. TODO: Do the same for the type constraints?
+data Delta = MkDelta { delta_ty_cs :: Bag EvVar
+                     , delta_tm_cs :: TmState }
+
+type ValSetAbs = [ValVec]  -- ^ Value Set Abstractions
+type Uncovered = ValSetAbs
+
+-- Instead of keeping the whole sets in memory, we keep a boolean for both the
+-- covered and the divergent set (we store the uncovered set though, since we
+-- want to print it). For both the covered and the divergent we have:
 --
---  * don't check for the type only; we need to make sure that we are really
---   dealing with one of the fake constructors and not with the real
---   representation
+--   True <=> The set is non-empty
+--
+-- hence:
+--  C = True             ==> Useful clause (no warning)
+--  C = False, D = True  ==> Clause with inaccessible RHS
+--  C = False, D = False ==> Redundant clause
+type Triple = (Bool, Uncovered, Bool)
 
-make_whole_con :: DataCon -> WarningPat
-make_whole_con con | isInfixCon con = nlInfixConPat name
-                                           nlWildPatName nlWildPatName
-                   | otherwise      = nlConPatName name pats
-                where
-                  name   = getName con
-                  pats   = [nlWildPatName | _ <- dataConOrigArgTys con]
+-- | Pattern check result
+--
+-- * Redundant clauses
+-- * Not-covered clauses
+-- * Clauses with inaccessible RHS
+type PmResult = ([Located [LPat Id]], Uncovered, [Located [LPat Id]])
 
 {-
-------------------------------------------------------------------------
-                   Tidying equations
-------------------------------------------------------------------------
-
-tidy_eqn does more or less the same thing as @tidy@ in @Match.lhs@;
-that is, it removes syntactic sugar, reducing the number of cases that
-must be handled by the main checking algorithm.  One difference is
-that here we can do *all* the tidying at once (recursively), rather
-than doing it incrementally.
+%************************************************************************
+%*                                                                      *
+       Entry points to the checker: checkSingle and checkMatches
+%*                                                                      *
+%************************************************************************
 -}
 
-tidy_eqn :: EquationInfo -> EquationInfo
-tidy_eqn eqn = eqn { eqn_pats = map tidy_pat (eqn_pats eqn),
-                     eqn_rhs  = tidy_rhs (eqn_rhs eqn) }
+-- | Check a single pattern binding (let)
+checkSingle :: DynFlags -> DsMatchContext -> Id -> Pat Id -> DsM ()
+checkSingle dflags ctxt@(DsMatchContext _ locn) var p = do
+  mb_pm_res <- tryM (checkSingle' locn var p)
+  case mb_pm_res of
+    Left  _   -> warnPmIters dflags ctxt
+    Right res -> dsPmWarn dflags ctxt res
+
+-- | Check a single pattern binding (let)
+checkSingle' :: SrcSpan -> Id -> Pat Id -> DsM PmResult
+checkSingle' locn var p = do
+  resetPmIterDs -- set the iter-no to zero
+  fam_insts <- dsGetFamInstEnvs
+  clause    <- translatePat fam_insts p
+  missing   <- mkInitialUncovered [var]
+  (cs,us,ds) <- runMany (pmcheckI clause []) missing -- no guards
+  return $ case (cs,ds) of
+    (True,  _    ) -> ([], us, []) -- useful
+    (False, False) -> ( m, us, []) -- redundant
+    (False, True ) -> ([], us,  m) -- inaccessible rhs
+  where m = [L locn [L locn p]]
+
+-- | Check a matchgroup (case, functions, etc.)
+checkMatches :: DynFlags -> DsMatchContext
+             -> [Id] -> [LMatch Id (LHsExpr Id)] -> DsM ()
+checkMatches dflags ctxt vars matches = do
+  mb_pm_res <- tryM (checkMatches' vars matches)
+  case mb_pm_res of
+    Left  _   -> warnPmIters dflags ctxt
+    Right res -> dsPmWarn dflags ctxt res
+
+-- | Check a matchgroup (case, functions, etc.)
+checkMatches' :: [Id] -> [LMatch Id (LHsExpr Id)] -> DsM PmResult
+checkMatches' vars matches
+  | null matches = return ([], [], [])
+  | otherwise = do
+      resetPmIterDs -- set the iter-no to zero
+      missing    <- mkInitialUncovered vars
+      (rs,us,ds) <- go matches missing
+      return (map hsLMatchToLPats rs, us, map hsLMatchToLPats ds)
   where
-        -- Horrible hack.  The tidy_pat stuff converts "might-fail" patterns to
-        -- WildPats which of course loses the info that they can fail to match.
-        -- So we stick in a CanFail as if it were a guard.
-    tidy_rhs (MatchResult can_fail body)
-        | any might_fail_pat (eqn_pats eqn) = MatchResult CanFail body
-        | otherwise                         = MatchResult can_fail body
+    go []     missing = return ([], missing, [])
+    go (m:ms) missing = do
+      fam_insts          <- dsGetFamInstEnvs
+      (clause, guards)   <- translateMatch fam_insts m
+      (cs, missing', ds) <- runMany (pmcheckI clause guards) missing
+      (rs, final_u, is)  <- go ms missing'
+      return $ case (cs, ds) of
+        (True,  _    ) -> (  rs, final_u,   is) -- useful
+        (False, False) -> (m:rs, final_u,   is) -- redundant
+        (False, True ) -> (  rs, final_u, m:is) -- inaccessible
 
---------------
-might_fail_pat :: Pat Id -> Bool
--- Returns True of patterns that might fail (i.e. fall through) in a way
--- that is not covered by the checking algorithm.  Specifically:
---         NPlusKPat
---         ViewPat (if refutable)
---         ConPatOut of a PatSynCon
+    hsLMatchToLPats :: LMatch id body -> Located [LPat id]
+    hsLMatchToLPats (L l (Match _ pats _ _)) = L l pats
 
--- First the two special cases
-might_fail_pat (NPlusKPat {})                = True
-might_fail_pat (ViewPat _ p _)               = not (isIrrefutableHsPat p)
+{-
+%************************************************************************
+%*                                                                      *
+              Transform source syntax to *our* syntax
+%*                                                                      *
+%************************************************************************
+-}
 
--- Now the recursive stuff
-might_fail_pat (ParPat p)                    = might_fail_lpat p
-might_fail_pat (AsPat _ p)                   = might_fail_lpat p
-might_fail_pat (SigPatOut p _ )              = might_fail_lpat p
-might_fail_pat (ListPat ps _ Nothing)        = any might_fail_lpat ps
-might_fail_pat (ListPat _ _ (Just _))      = True
-might_fail_pat (TuplePat ps _ _)             = any might_fail_lpat ps
-might_fail_pat (PArrPat ps _)                = any might_fail_lpat ps
-might_fail_pat (BangPat p)                   = might_fail_lpat p
-might_fail_pat (ConPatOut { pat_con = con, pat_args = ps })
-  = case unLoc con of
-    RealDataCon _dcon -> any might_fail_lpat (hsConPatArgs ps)
-    PatSynCon _psyn -> True
+-- -----------------------------------------------------------------------
+-- * Utilities
 
--- Finally the ones that are sure to succeed, or which are covered by the checking algorithm
-might_fail_pat (LazyPat _)                   = False -- Always succeeds
-might_fail_pat _                             = False -- VarPat, WildPat, LitPat, NPat
+nullaryConPattern :: DataCon -> Pattern
+-- Nullary data constructor and nullary type constructor
+nullaryConPattern con =
+  PmCon { pm_con_con = con, pm_con_arg_tys = []
+        , pm_con_tvs = [], pm_con_dicts = [], pm_con_args = [] }
+{-# INLINE nullaryConPattern #-}
 
---------------
-might_fail_lpat :: LPat Id -> Bool
-might_fail_lpat (L _ p) = might_fail_pat p
+truePattern :: Pattern
+truePattern = nullaryConPattern trueDataCon
+{-# INLINE truePattern #-}
 
---------------
-tidy_lpat :: LPat Id -> LPat Id
-tidy_lpat p = fmap tidy_pat p
+-- | A fake guard pattern (True <- _) used to represent cases we cannot handle
+fake_pat :: Pattern
+fake_pat = PmGrd { pm_grd_pv   = [truePattern]
+                 , pm_grd_expr = PmExprOther EWildPat }
+{-# INLINE fake_pat #-}
 
---------------
-tidy_pat :: Pat Id -> Pat Id
-tidy_pat pat@(WildPat _)  = pat
-tidy_pat (VarPat id)      = WildPat (idType id)
-tidy_pat (ParPat p)       = tidy_pat (unLoc p)
-tidy_pat (LazyPat p)      = WildPat (hsLPatType p)      -- For overlap and exhaustiveness checking
-                                                        -- purposes, a ~pat is like a wildcard
-tidy_pat (BangPat p)      = tidy_pat (unLoc p)
-tidy_pat (AsPat _ p)      = tidy_pat (unLoc p)
-tidy_pat (SigPatOut p _)  = tidy_pat (unLoc p)
-tidy_pat (CoPat _ pat _)  = tidy_pat pat
+-- | Check whether a guard pattern is generated by the checker (unhandled)
+isFakeGuard :: [Pattern] -> PmExpr -> Bool
+isFakeGuard [PmCon { pm_con_con = c }] (PmExprOther EWildPat)
+  | c == trueDataCon = True
+  | otherwise        = False
+isFakeGuard _pats _e = False
 
--- These two are might_fail patterns, so we map them to
--- WildPats.  The might_fail_pat stuff arranges that the
--- guard says "this equation might fall through".
-tidy_pat (NPlusKPat id _ _ _) = WildPat (idType (unLoc id))
-tidy_pat (ViewPat _ _ ty)     = WildPat ty
-tidy_pat (ListPat _ _ (Just (ty,_))) = WildPat ty
-tidy_pat (ConPatOut { pat_con = L _ (PatSynCon syn), pat_arg_tys = tys })
-  = WildPat (patSynInstResTy syn tys)
+-- | Generate a `canFail` pattern vector of a specific type
+mkCanFailPmPat :: Type -> PmM PatVec
+mkCanFailPmPat ty = do
+  var <- mkPmVar ty
+  return [var, fake_pat]
 
-tidy_pat pat@(ConPatOut { pat_con = L _ con, pat_args = ps })
-  = pat { pat_args = tidy_con con ps }
+vanillaConPattern :: DataCon -> [Type] -> PatVec -> Pattern
+-- ADT constructor pattern => no existentials, no local constraints
+vanillaConPattern con arg_tys args =
+  PmCon { pm_con_con = con, pm_con_arg_tys = arg_tys
+        , pm_con_tvs = [], pm_con_dicts = [], pm_con_args = args }
+{-# INLINE vanillaConPattern #-}
 
-tidy_pat (ListPat ps ty Nothing)
-  = unLoc $ foldr (\ x y -> mkPrefixConPat consDataCon [x,y] [ty])
-                                  (mkNilPat ty)
-                                  (map tidy_lpat ps)
+-- | Create an empty list pattern of a given type
+nilPattern :: Type -> Pattern
+nilPattern ty =
+  PmCon { pm_con_con = nilDataCon, pm_con_arg_tys = [ty]
+        , pm_con_tvs = [], pm_con_dicts = []
+        , pm_con_args = [] }
+{-# INLINE nilPattern #-}
 
--- introduce fake parallel array constructors to be able to handle parallel
--- arrays with the existing machinery for constructor pattern
+mkListPatVec :: Type -> PatVec -> PatVec -> PatVec
+mkListPatVec ty xs ys = [PmCon { pm_con_con = consDataCon
+                               , pm_con_arg_tys = [ty]
+                               , pm_con_tvs = [], pm_con_dicts = []
+                               , pm_con_args = xs++ys }]
+{-# INLINE mkListPatVec #-}
+
+-- | Create a (non-overloaded) literal pattern
+mkLitPattern :: HsLit -> Pattern
+mkLitPattern lit = PmLit { pm_lit_lit = PmSLit lit }
+{-# INLINE mkLitPattern #-}
+
+-- -----------------------------------------------------------------------
+-- * Transform (Pat Id) into of (PmPat Id)
+
+translatePat :: FamInstEnvs -> Pat Id -> PmM PatVec
+translatePat fam_insts pat = case pat of
+  WildPat ty  -> mkPmVars [ty]
+  VarPat  id  -> return [PmVar (unLoc id)]
+  ParPat p    -> translatePat fam_insts (unLoc p)
+  LazyPat _   -> mkPmVars [hsPatType pat] -- like a variable
+
+  -- ignore strictness annotations for now
+  BangPat p   -> translatePat fam_insts (unLoc p)
+
+  AsPat lid p -> do
+     -- Note [Translating As Patterns]
+    ps <- translatePat fam_insts (unLoc p)
+    let [e] = map vaToPmExpr (coercePatVec ps)
+        g   = PmGrd [PmVar (unLoc lid)] e
+    return (ps ++ [g])
+
+  SigPatOut p _ty -> translatePat fam_insts (unLoc p)
+
+  -- See Note [Translate CoPats]
+  CoPat wrapper p ty
+    | isIdHsWrapper wrapper                   -> translatePat fam_insts p
+    | WpCast co <-  wrapper, isReflexiveCo co -> translatePat fam_insts p
+    | otherwise -> do
+        ps      <- translatePat fam_insts p
+        (xp,xe) <- mkPmId2Forms ty
+        let g = mkGuard ps (HsWrap wrapper (unLoc xe))
+        return [xp,g]
+
+  -- (n + k)  ===>   x (True <- x >= k) (n <- x-k)
+  NPlusKPat (L _ _n) _k1 _k2 _ge _minus ty -> mkCanFailPmPat ty
+
+  -- (fun -> pat)   ===>   x (pat <- fun x)
+  ViewPat lexpr lpat arg_ty -> do
+    ps <- translatePat fam_insts (unLoc lpat)
+    -- See Note [Guards and Approximation]
+    case all cantFailPattern ps of
+      True  -> do
+        (xp,xe) <- mkPmId2Forms arg_ty
+        let g = mkGuard ps (HsApp lexpr xe)
+        return [xp,g]
+      False -> mkCanFailPmPat arg_ty
+
+  -- list
+  ListPat ps ty Nothing -> do
+    foldr (mkListPatVec ty) [nilPattern ty]
+      <$> translatePatVec fam_insts (map unLoc ps)
+
+  -- overloaded list
+  ListPat lpats elem_ty (Just (pat_ty, _to_list))
+    | Just e_ty <- splitListTyConApp_maybe pat_ty
+    , (_, norm_elem_ty) <- normaliseType fam_insts Nominal elem_ty
+         -- elem_ty is frequently something like
+         -- `Item [Int]`, but we prefer `Int`
+    , norm_elem_ty `eqType` e_ty ->
+        -- We have to ensure that the element types are exactly the same.
+        -- Otherwise, one may give an instance IsList [Int] (more specific than
+        -- the default IsList [a]) with a different implementation for `toList'
+        translatePat fam_insts (ListPat lpats e_ty Nothing)
+      -- See Note [Guards and Approximation]
+    | otherwise -> mkCanFailPmPat pat_ty
+
+  ConPatOut { pat_con = L _ (PatSynCon _) } ->
+    -- Pattern synonyms have a "matcher"
+    -- (see Note [Pattern synonym representation] in PatSyn.hs
+    -- We should be able to transform (P x y)
+    -- to   v (Just (x, y) <- matchP v (\x y -> Just (x,y)) Nothing
+    -- That is, a combination of a variable pattern and a guard
+    -- But there are complications with GADTs etc, and this isn't done yet
+    mkCanFailPmPat (hsPatType pat)
+
+  ConPatOut { pat_con     = L _ (RealDataCon con)
+            , pat_arg_tys = arg_tys
+            , pat_tvs     = ex_tvs
+            , pat_dicts   = dicts
+            , pat_args    = ps } -> do
+    args <- translateConPatVec fam_insts arg_tys ex_tvs con ps
+    return [PmCon { pm_con_con     = con
+                  , pm_con_arg_tys = arg_tys
+                  , pm_con_tvs     = ex_tvs
+                  , pm_con_dicts   = dicts
+                  , pm_con_args    = args }]
+
+  NPat (L _ ol) mb_neg _eq ty -> translateNPat fam_insts ol mb_neg ty
+
+  LitPat lit
+      -- If it is a string then convert it to a list of characters
+    | HsString src s <- lit ->
+        foldr (mkListPatVec charTy) [nilPattern charTy] <$>
+          translatePatVec fam_insts (map (LitPat . HsChar src) (unpackFS s))
+    | otherwise -> return [mkLitPattern lit]
+
+  PArrPat ps ty -> do
+    tidy_ps <- translatePatVec fam_insts (map unLoc ps)
+    let fake_con = parrFakeCon (length ps)
+    return [vanillaConPattern fake_con [ty] (concat tidy_ps)]
+
+  TuplePat ps boxity tys -> do
+    tidy_ps <- translatePatVec fam_insts (map unLoc ps)
+    let tuple_con = tupleDataCon boxity (length ps)
+    return [vanillaConPattern tuple_con tys (concat tidy_ps)]
+
+  -- --------------------------------------------------------------------------
+  -- Not supposed to happen
+  ConPatIn  {} -> panic "Check.translatePat: ConPatIn"
+  SplicePat {} -> panic "Check.translatePat: SplicePat"
+  SigPatIn  {} -> panic "Check.translatePat: SigPatIn"
+
+-- | Translate an overloaded literal (see `tidyNPat' in deSugar/MatchLit.hs)
+translateNPat :: FamInstEnvs
+              -> HsOverLit Id -> Maybe (SyntaxExpr Id) -> Type -> PmM PatVec
+translateNPat fam_insts (OverLit val False _ ty) mb_neg outer_ty
+  | not type_change, isStringTy ty, HsIsString src s <- val, Nothing <- mb_neg
+  = translatePat fam_insts (LitPat (HsString src s))
+  | not type_change, isIntTy    ty, HsIntegral src i <- val
+  = translatePat fam_insts (mk_num_lit HsInt src i)
+  | not type_change, isWordTy   ty, HsIntegral src i <- val
+  = translatePat fam_insts (mk_num_lit HsWordPrim src i)
+  where
+    type_change = not (outer_ty `eqType` ty)
+    mk_num_lit c src i = LitPat $ case mb_neg of
+      Nothing -> c src i
+      Just _  -> c src (-i)
+translateNPat _ ol mb_neg _
+  = return [PmLit { pm_lit_lit = PmOLit (isJust mb_neg) ol }]
+
+-- | Translate a list of patterns (Note: each pattern is translated
+-- to a pattern vector but we do not concatenate the results).
+translatePatVec :: FamInstEnvs -> [Pat Id] -> PmM [PatVec]
+translatePatVec fam_insts pats = mapM (translatePat fam_insts) pats
+
+-- | Translate a constructor pattern
+translateConPatVec :: FamInstEnvs -> [Type] -> [TyVar]
+                   -> DataCon -> HsConPatDetails Id -> PmM PatVec
+translateConPatVec fam_insts _univ_tys _ex_tvs _ (PrefixCon ps)
+  = concat <$> translatePatVec fam_insts (map unLoc ps)
+translateConPatVec fam_insts _univ_tys _ex_tvs _ (InfixCon p1 p2)
+  = concat <$> translatePatVec fam_insts (map unLoc [p1,p2])
+translateConPatVec fam_insts  univ_tys  ex_tvs c (RecCon (HsRecFields fs _))
+    -- Nothing matched. Make up some fresh term variables
+  | null fs        = mkPmVars arg_tys
+    -- The data constructor was not defined using record syntax. For the
+    -- pattern to be in record syntax it should be empty (e.g. Just {}).
+    -- So just like the previous case.
+  | null orig_lbls = ASSERT(null matched_lbls) mkPmVars arg_tys
+    -- Some of the fields appear, in the original order (there may be holes).
+    -- Generate a simple constructor pattern and make up fresh variables for
+    -- the rest of the fields
+  | matched_lbls `subsetOf` orig_lbls
+  = ASSERT(length orig_lbls == length arg_tys)
+      let translateOne (lbl, ty) = case lookup lbl matched_pats of
+            Just p  -> translatePat fam_insts p
+            Nothing -> mkPmVars [ty]
+      in  concatMapM translateOne (zip orig_lbls arg_tys)
+    -- The fields that appear are not in the correct order. Make up fresh
+    -- variables for all fields and add guards after matching, to force the
+    -- evaluation in the correct order.
+  | otherwise = do
+      arg_var_pats    <- mkPmVars arg_tys
+      translated_pats <- forM matched_pats $ \(x,pat) -> do
+        pvec <- translatePat fam_insts pat
+        return (x, pvec)
+
+      let zipped = zip orig_lbls [ x | PmVar x <- arg_var_pats ]
+          guards = map (\(name,pvec) -> case lookup name zipped of
+                            Just x  -> PmGrd pvec (PmExprVar (idName x))
+                            Nothing -> panic "translateConPatVec: lookup")
+                       translated_pats
+
+      return (arg_var_pats ++ guards)
+  where
+    -- The actual argument types (instantiated)
+    arg_tys = dataConInstOrigArgTys c (univ_tys ++ mkTyVarTys ex_tvs)
+
+    -- Some label information
+    orig_lbls    = map flSelector $ dataConFieldLabels c
+    matched_pats = [ (getName (unLoc (hsRecFieldId x)), unLoc (hsRecFieldArg x))
+                   | L _ x <- fs]
+    matched_lbls = [ name | (name, _pat) <- matched_pats ]
+
+    subsetOf :: Eq a => [a] -> [a] -> Bool
+    subsetOf []     _  = True
+    subsetOf (_:_)  [] = False
+    subsetOf (x:xs) (y:ys)
+      | x == y    = subsetOf    xs  ys
+      | otherwise = subsetOf (x:xs) ys
+
+-- Translate a single match
+translateMatch :: FamInstEnvs -> LMatch Id (LHsExpr Id) -> PmM (PatVec,[PatVec])
+translateMatch fam_insts (L _ (Match _ lpats _ grhss)) = do
+  pats'   <- concat <$> translatePatVec fam_insts pats
+  guards' <- mapM (translateGuards fam_insts) guards
+  return (pats', guards')
+  where
+    extractGuards :: LGRHS Id (LHsExpr Id) -> [GuardStmt Id]
+    extractGuards (L _ (GRHS gs _)) = map unLoc gs
+
+    pats   = map unLoc lpats
+    guards = map extractGuards (grhssGRHSs grhss)
+
+-- -----------------------------------------------------------------------
+-- * Transform source guards (GuardStmt Id) to PmPats (Pattern)
+
+-- | Translate a list of guard statements to a pattern vector
+translateGuards :: FamInstEnvs -> [GuardStmt Id] -> PmM PatVec
+translateGuards fam_insts guards = do
+  all_guards <- concat <$> mapM (translateGuard fam_insts) guards
+  return (replace_unhandled all_guards)
+  -- It should have been (return all_guards) but it is too expressive.
+  -- Since the term oracle does not handle all constraints we generate,
+  -- we (hackily) replace all constraints the oracle cannot handle with a
+  -- single one (we need to know if there is a possibility of falure).
+  -- See Note [Guards and Approximation] for all guard-related approximations
+  -- we implement.
+  where
+    replace_unhandled :: PatVec -> PatVec
+    replace_unhandled gv
+      | any_unhandled gv = fake_pat : [ p | p <- gv, shouldKeep p ]
+      | otherwise        = gv
+
+    any_unhandled :: PatVec -> Bool
+    any_unhandled gv = any (not . shouldKeep) gv
+
+    shouldKeep :: Pattern -> Bool
+    shouldKeep p
+      | PmVar {} <- p      = True
+      | PmCon {} <- p      = length (allConstructors (pm_con_con p)) == 1
+                             && all shouldKeep (pm_con_args p)
+    shouldKeep (PmGrd pv e)
+      | all shouldKeep pv  = True
+      | isNotPmExprOther e = True  -- expensive but we want it
+    shouldKeep _other_pat  = False -- let the rest..
+
+-- | Check whether a pattern can fail to match
+cantFailPattern :: Pattern -> Bool
+cantFailPattern p
+  | PmVar {} <- p = True
+  | PmCon {} <- p = length (allConstructors (pm_con_con p)) == 1
+                    && all cantFailPattern (pm_con_args p)
+cantFailPattern (PmGrd pv _e)
+                  = all cantFailPattern pv
+cantFailPattern _ = False
+
+-- | Translate a guard statement to Pattern
+translateGuard :: FamInstEnvs -> GuardStmt Id -> PmM PatVec
+translateGuard fam_insts guard = case guard of
+  BodyStmt   e _ _ _ -> translateBoolGuard e
+  LetStmt      binds -> translateLet (unLoc binds)
+  BindStmt p e _ _ _ -> translateBind fam_insts p e
+  LastStmt        {} -> panic "translateGuard LastStmt"
+  ParStmt         {} -> panic "translateGuard ParStmt"
+  TransStmt       {} -> panic "translateGuard TransStmt"
+  RecStmt         {} -> panic "translateGuard RecStmt"
+  ApplicativeStmt {} -> panic "translateGuard ApplicativeLastStmt"
+
+-- | Translate let-bindings
+translateLet :: HsLocalBinds Id -> PmM PatVec
+translateLet _binds = return []
+
+-- | Translate a pattern guard
+translateBind :: FamInstEnvs -> LPat Id -> LHsExpr Id -> PmM PatVec
+translateBind fam_insts (L _ p) e = do
+  ps <- translatePat fam_insts p
+  return [mkGuard ps (unLoc e)]
+
+-- | Translate a boolean guard
+translateBoolGuard :: LHsExpr Id -> PmM PatVec
+translateBoolGuard e
+  | isJust (isTrueLHsExpr e) = return []
+    -- The formal thing to do would be to generate (True <- True)
+    -- but it is trivial to solve so instead we give back an empty
+    -- PatVec for efficiency
+  | otherwise = return [mkGuard [truePattern] (unLoc e)]
+
+{- Note [Guards and Approximation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Even if the algorithm is really expressive, the term oracle we use is not.
+Hence, several features are not translated *properly* but we approximate.
+The list includes:
+
+1. View Patterns
+----------------
+A view pattern @(f -> p)@ should be translated to @x (p <- f x)@. The term
+oracle does not handle function applications so we know that the generated
+constraints will not be handled at the end. Hence, we distinguish between two
+cases:
+  a) Pattern @p@ cannot fail. Then this is just a binding and we do the *right
+     thing*.
+  b) Pattern @p@ can fail. This means that when checking the guard, we will
+     generate several cases, with no useful information. E.g.:
+
+       h (f -> [a,b]) = ...
+       h x ([a,b] <- f x) = ...
+
+       uncovered set = { [x |> { False ~ (f x ~ [])            }]
+                       , [x |> { False ~ (f x ~ (t1:[]))       }]
+                       , [x |> { False ~ (f x ~ (t1:t2:t3:t4)) }] }
+
+     So we have two problems:
+       1) Since we do not print the constraints in the general case (they may
+          be too many), the warning will look like this:
+
+            Pattern match(es) are non-exhaustive
+            In an equation for `h':
+                Patterns not matched:
+                    _
+                    _
+                    _
+          Which is not short and not more useful than a single underscore.
+       2) The size of the uncovered set increases a lot, without gaining more
+          expressivity in our warnings.
+
+     Hence, in this case, we replace the guard @([a,b] <- f x)@ with a *dummy*
+     @fake_pat@: @True <- _@. That is, we record that there is a possibility
+     of failure but we minimize it to a True/False. This generates a single
+     warning and much smaller uncovered sets.
+
+2. Overloaded Lists
+-------------------
+An overloaded list @[...]@ should be translated to @x ([...] <- toList x)@. The
+problem is exactly like above, as its solution. For future reference, the code
+below is the *right thing to do*:
+
+   ListPat lpats elem_ty (Just (pat_ty, to_list))
+     otherwise -> do
+       (xp, xe) <- mkPmId2Forms pat_ty
+       ps       <- translatePatVec (map unLoc lpats)
+       let pats = foldr (mkListPatVec elem_ty) [nilPattern elem_ty] ps
+           g    = mkGuard pats (HsApp (noLoc to_list) xe)
+       return [xp,g]
+
+3. Overloaded Literals
+----------------------
+The case with literals is a bit different. a literal @l@ should be translated
+to @x (True <- x == from l)@. Since we want to have better warnings for
+overloaded literals as it is a very common feature, we treat them differently.
+They are mainly covered in Note [Undecidable Equality on Overloaded Literals]
+in PmExpr.
+
+4. N+K Patterns & Pattern Synonyms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An n+k pattern (n+k) should be translated to @x (True <- x >= k) (n <- x-k)@.
+Since the only pattern of the three that causes failure is guard @(n <- x-k)@,
+and has two possible outcomes. Hence, there is no benefit in using a dummy and
+we implement the proper thing. Pattern synonyms are simply not implemented yet.
+Hence, to be conservative, we generate a dummy pattern, assuming that the
+pattern can fail.
+
+5. Actual Guards
+----------------
+During translation, boolean guards and pattern guards are translated properly.
+Let bindings though are omitted by function @translateLet@. Since they are lazy
+bindings, we do not actually want to generate a (strict) equality (like we do
+in the pattern bind case). Hence, we safely drop them.
+
+Additionally, top-level guard translation (performed by @translateGuards@)
+replaces guards that cannot be reasoned about (like the ones we described in
+1-4) with a single @fake_pat@ to record the possibility of failure to match.
+
+Note [Translate CoPats]
+~~~~~~~~~~~~~~~~~~~~~~~
+The pattern match checker did not know how to handle coerced patterns `CoPat`
+efficiently, which gave rise to #11276. The original approach translated
+`CoPat`s:
+
+    pat |> co    ===>    x (pat <- (e |> co))
+
+Instead, we now check whether the coercion is a hole or if it is just refl, in
+which case we can drop it. Unfortunately, data families generate useful
+coercions so guards are still generated in these cases and checking data
+families is not really efficient.
+
+%************************************************************************
+%*                                                                      *
+                 Utilities for Pattern Match Checking
+%*                                                                      *
+%************************************************************************
+-}
+
+-- ----------------------------------------------------------------------------
+-- * Basic utilities
+
+-- | Get the type out of a PmPat. For guard patterns (ps <- e) we use the type
+-- of the first (or the single -WHEREVER IT IS- valid to use?) pattern
+pmPatType :: PmPat p -> Type
+pmPatType (PmCon { pm_con_con = con, pm_con_arg_tys = tys })
+  = mkTyConApp (dataConTyCon con) tys
+pmPatType (PmVar  { pm_var_id  = x }) = idType x
+pmPatType (PmLit  { pm_lit_lit = l }) = pmLitType l
+pmPatType (PmNLit { pm_lit_id  = x }) = idType x
+pmPatType (PmGrd  { pm_grd_pv  = pv })
+  = ASSERT(patVecArity pv == 1) (pmPatType p)
+  where Just p = find ((==1) . patternArity) pv
+
+-- | Generate a value abstraction for a given constructor (generate
+-- fresh variables of the appropriate type for arguments)
+mkOneConFull :: Id -> DataCon -> PmM (ValAbs, ComplexEq, Bag EvVar)
+--  *  x :: T tys, where T is an algebraic data type
+--     NB: in the case of a data familiy, T is the *representation* TyCon
+--     e.g.   data instance T (a,b) = T1 a b
+--       leads to
+--            data TPair a b = T1 a b  -- The "representation" type
+--       It is TPair, not T, that is given to mkOneConFull
 --
-tidy_pat (PArrPat ps ty)
-  = unLoc $ mkPrefixConPat (parrFakeCon (length ps))
-                           (map tidy_lpat ps)
-                           [ty]
+--  * 'con' K is a constructor of data type T
+--
+-- After instantiating the universal tyvars of K we get
+--          K tys :: forall bs. Q => s1 .. sn -> T tys
+--
+-- Results: ValAbs:          K (y1::s1) .. (yn::sn)
+--          ComplexEq:       x ~ K y1..yn
+--          [EvVar]:         Q
+mkOneConFull x con = do
+  let -- res_ty == TyConApp (dataConTyCon cabs_con) cabs_arg_tys
+      res_ty  = idType x
+      (univ_tvs, ex_tvs, eq_spec, thetas, arg_tys, _) = dataConFullSig con
+      data_tc = dataConTyCon con   -- The representation TyCon
+      tc_args = case splitTyConApp_maybe res_ty of
+                  Just (tc, tys) -> ASSERT( tc == data_tc ) tys
+                  Nothing -> pprPanic "mkOneConFull: Not TyConApp:" (ppr res_ty)
+      subst1  = zipTvSubst univ_tvs tc_args
 
-tidy_pat (TuplePat ps boxity tys)
-  = unLoc $ mkPrefixConPat (tupleCon (boxityNormalTupleSort boxity) arity)
-                           (map tidy_lpat ps) tys
+  (subst, ex_tvs') <- cloneTyVarBndrs subst1 ex_tvs <$> getUniqueSupplyM
+
+  -- Fresh term variables (VAs) as arguments to the constructor
+  arguments <-  mapM mkPmVar (substTys subst arg_tys)
+  -- All constraints bound by the constructor (alpha-renamed)
+  let theta_cs = substTheta subst (eqSpecPreds eq_spec ++ thetas)
+  evvars <- mapM (nameType "pm") theta_cs
+  let con_abs  = PmCon { pm_con_con     = con
+                       , pm_con_arg_tys = tc_args
+                       , pm_con_tvs     = ex_tvs'
+                       , pm_con_dicts   = evvars
+                       , pm_con_args    = arguments }
+  return (con_abs, (PmExprVar (idName x), vaToPmExpr con_abs), listToBag evvars)
+
+-- ----------------------------------------------------------------------------
+-- * More smart constructors and fresh variable generation
+
+-- | Create a guard pattern
+mkGuard :: PatVec -> HsExpr Id -> Pattern
+mkGuard pv e
+  | all cantFailPattern pv = PmGrd pv expr
+  | PmExprOther {} <- expr = fake_pat
+  | otherwise              = PmGrd pv expr
   where
-    arity = length ps
+    expr = hsExprToPmExpr e
 
-tidy_pat (NPat (L _ lit) mb_neg eq) = tidyNPat tidy_lit_pat lit mb_neg eq
-tidy_pat (LitPat lit)         = tidy_lit_pat lit
+-- | Create a term equality of the form: `(False ~ (x ~ lit))`
+mkNegEq :: Id -> PmLit -> ComplexEq
+mkNegEq x l = (falsePmExpr, PmExprVar (idName x) `PmExprEq` PmExprLit l)
+{-# INLINE mkNegEq #-}
 
-tidy_pat (ConPatIn {})        = panic "Check.tidy_pat: ConPatIn"
-tidy_pat (SplicePat {})       = panic "Check.tidy_pat: SplicePat"
-tidy_pat (QuasiQuotePat {})   = panic "Check.tidy_pat: QuasiQuotePat"
-tidy_pat (SigPatIn {})        = panic "Check.tidy_pat: SigPatIn"
+-- | Create a term equality of the form: `(x ~ lit)`
+mkPosEq :: Id -> PmLit -> ComplexEq
+mkPosEq x l = (PmExprVar (idName x), PmExprLit l)
+{-# INLINE mkPosEq #-}
 
-tidy_lit_pat :: HsLit -> Pat Id
--- Unpack string patterns fully, so we can see when they
--- overlap with each other, or even explicit lists of Chars.
-tidy_lit_pat lit
-  | HsString src s <- lit
-  = unLoc $ foldr (\c pat -> mkPrefixConPat consDataCon
-                                             [mkCharLitPat src c, pat] [charTy])
-                  (mkPrefixConPat nilDataCon [] [charTy]) (unpackFS s)
-  | otherwise
-  = tidyLitPat lit
+-- | Generate a variable pattern of a given type
+mkPmVar :: Type -> PmM (PmPat p)
+mkPmVar ty = PmVar <$> mkPmId ty
+{-# INLINE mkPmVar #-}
 
------------------
-tidy_con :: ConLike -> HsConPatDetails Id -> HsConPatDetails Id
-tidy_con _   (PrefixCon ps)   = PrefixCon (map tidy_lpat ps)
-tidy_con _   (InfixCon p1 p2) = PrefixCon [tidy_lpat p1, tidy_lpat p2]
-tidy_con con (RecCon (HsRecFields fs _))
-  | null fs   = PrefixCon (replicate arity nlWildPatId)
-                -- Special case for null patterns; maybe not a record at all
-  | otherwise = PrefixCon (map (tidy_lpat.snd) all_pats)
+-- | Generate many variable patterns, given a list of types
+mkPmVars :: [Type] -> PmM PatVec
+mkPmVars tys = mapM mkPmVar tys
+{-# INLINE mkPmVars #-}
+
+-- | Generate a fresh `Id` of a given type
+mkPmId :: Type -> PmM Id
+mkPmId ty = getUniqueM >>= \unique ->
+  let occname = mkVarOccFS (fsLit (show unique))
+      name    = mkInternalName unique occname noSrcSpan
+  in  return (mkLocalId name ty)
+
+-- | Generate a fresh term variable of a given and return it in two forms:
+-- * A variable pattern
+-- * A variable expression
+mkPmId2Forms :: Type -> PmM (Pattern, LHsExpr Id)
+mkPmId2Forms ty = do
+  x <- mkPmId ty
+  return (PmVar x, noLoc (HsVar (noLoc x)))
+
+-- ----------------------------------------------------------------------------
+-- * Converting between Value Abstractions, Patterns and PmExpr
+
+-- | Convert a value abstraction an expression
+vaToPmExpr :: ValAbs -> PmExpr
+vaToPmExpr (PmCon  { pm_con_con = c, pm_con_args = ps })
+  = PmExprCon c (map vaToPmExpr ps)
+vaToPmExpr (PmVar  { pm_var_id  = x }) = PmExprVar (idName x)
+vaToPmExpr (PmLit  { pm_lit_lit = l }) = PmExprLit l
+vaToPmExpr (PmNLit { pm_lit_id  = x }) = PmExprVar (idName x)
+
+-- | Convert a pattern vector to a list of value abstractions by dropping the
+-- guards (See Note [Translating As Patterns])
+coercePatVec :: PatVec -> [ValAbs]
+coercePatVec pv = concatMap coercePmPat pv
+
+-- | Convert a pattern to a list of value abstractions (will be either an empty
+-- list if the pattern is a guard pattern, or a singleton list in all other
+-- cases) by dropping the guards (See Note [Translating As Patterns])
+coercePmPat :: Pattern -> [ValAbs]
+coercePmPat (PmVar { pm_var_id  = x }) = [PmVar { pm_var_id  = x }]
+coercePmPat (PmLit { pm_lit_lit = l }) = [PmLit { pm_lit_lit = l }]
+coercePmPat (PmCon { pm_con_con = con, pm_con_arg_tys = arg_tys
+                   , pm_con_tvs = tvs, pm_con_dicts = dicts
+                   , pm_con_args = args })
+  = [PmCon { pm_con_con  = con, pm_con_arg_tys = arg_tys
+           , pm_con_tvs  = tvs, pm_con_dicts = dicts
+           , pm_con_args = coercePatVec args }]
+coercePmPat (PmGrd {}) = [] -- drop the guards
+
+-- | Get all constructors in the family (including given)
+allConstructors :: DataCon -> [DataCon]
+allConstructors = tyConDataCons . dataConTyCon
+
+-- -----------------------------------------------------------------------
+-- * Types and constraints
+
+newEvVar :: Name -> Type -> EvVar
+newEvVar name ty = mkLocalId name (toTcType ty)
+
+nameType :: String -> Type -> PmM EvVar
+nameType name ty = do
+  unique <- getUniqueM
+  let occname = mkVarOccFS (fsLit (name++"_"++show unique))
+      idname  = mkInternalName unique occname noSrcSpan
+  return (newEvVar idname ty)
+
+{-
+%************************************************************************
+%*                                                                      *
+                              The type oracle
+%*                                                                      *
+%************************************************************************
+-}
+
+-- | Check whether a set of type constraints is satisfiable.
+tyOracle :: Bag EvVar -> PmM Bool
+tyOracle evs
+  = do { ((_warns, errs), res) <- initTcDsForSolver $ tcCheckSatisfiability evs
+       ; case res of
+            Just sat -> return sat
+            Nothing  -> pprPanic "tyOracle" (vcat $ pprErrMsgBagWithLoc errs) }
+
+{-
+%************************************************************************
+%*                                                                      *
+                             Sanity Checks
+%*                                                                      *
+%************************************************************************
+-}
+
+-- | The arity of a pattern/pattern vector is the
+-- number of top-level patterns that are not guards
+type PmArity = Int
+
+-- | Compute the arity of a pattern vector
+patVecArity :: PatVec -> PmArity
+patVecArity = sum . map patternArity
+
+-- | Compute the arity of a pattern
+patternArity :: Pattern -> PmArity
+patternArity (PmGrd {}) = 0
+patternArity _other_pat = 1
+
+{-
+%************************************************************************
+%*                                                                      *
+            Heart of the algorithm: Function pmcheck
+%*                                                                      *
+%************************************************************************
+
+Main functions are:
+
+* mkInitialUncovered :: [Id] -> PmM Uncovered
+
+  Generates the initial uncovered set. Term and type constraints in scope
+  are checked, if they are inconsistent, the set is empty, otherwise, the
+  set contains only a vector of variables with the constraints in scope.
+
+* pmcheck :: PatVec -> [PatVec] -> ValVec -> PmM Triple
+
+  Checks redundancy, coverage and inaccessibility, using auxilary functions
+  `pmcheckGuards` and `pmcheckHd`. Mainly handles the guard case which is
+  common in all three checks (see paper) and calls `pmcheckGuards` when the
+  whole clause is checked, or `pmcheckHd` when the pattern vector does not
+  start with a guard.
+
+* pmcheckGuards :: [PatVec] -> ValVec -> PmM Triple
+
+  Processes the guards.
+
+* pmcheckHd :: Pattern -> PatVec -> [PatVec]
+          -> ValAbs -> ValVec -> PmM Triple
+
+  Worker: This function implements functions `covered`, `uncovered` and
+  `divergent` from the paper at once. Slightly different from the paper because
+  it does not even produce the covered and uncovered sets. Since we only care
+  about whether a clause covers SOMETHING or if it may forces ANY argument, we
+  only store a boolean in both cases, for efficiency.
+-}
+
+-- | Lift a pattern matching action from a single value vector abstration to a
+-- value set abstraction, but calling it on every vector and the combining the
+-- results.
+runMany :: (ValVec -> PmM Triple) -> (Uncovered -> PmM Triple)
+runMany pm us = mapAndUnzip3M pm us >>= \(css, uss, dss) ->
+                  return (or css, concat uss, or dss)
+{-# INLINE runMany #-}
+
+-- | Generate the initial uncovered set. It initializes the
+-- delta with all term and type constraints in scope.
+mkInitialUncovered :: [Id] -> PmM Uncovered
+mkInitialUncovered vars = do
+  ty_cs  <- getDictsDs
+  tm_cs  <- map toComplex . bagToList <$> getTmCsDs
+  sat_ty <- tyOracle ty_cs
+  return $ case (sat_ty, tmOracle initialTmState tm_cs) of
+    (True, Just tm_state) -> [ValVec patterns (MkDelta ty_cs tm_state)]
+    -- If any of the term/type constraints are non
+    -- satisfiable, the initial uncovered set is empty
+    _non_satisfiable      -> []
   where
-    arity = case con of
-        RealDataCon dcon -> dataConSourceArity dcon
-        PatSynCon psyn -> patSynArity psyn
+    patterns  = map PmVar vars
 
-     -- pad out all the missing fields with WildPats.
-    field_pats = case con of
-        RealDataCon dc -> map (\ f -> (f, nlWildPatId)) (dataConFieldLabels dc)
-        PatSynCon{}    -> panic "Check.tidy_con: pattern synonym with record syntax"
-    all_pats = foldr (\(L _ (HsRecField id p _)) acc
-                                         -> insertNm (getName (unLoc id)) p acc)
-                     field_pats fs
+-- | Increase the counter for elapsed algorithm iterations, check that the
+-- limit is not exceeded and call `pmcheck`
+pmcheckI :: PatVec -> [PatVec] -> ValVec -> PmM Triple
+pmcheckI ps guards vva = incrCheckPmIterDs >> pmcheck ps guards vva
+{-# INLINE pmcheckI #-}
 
-    insertNm nm p [] = [(nm,p)]
-    insertNm nm p (x@(n,_):xs)
-      | nm == n    = (nm,p):xs
-      | otherwise  = x : insertNm nm p xs
+-- | Increase the counter for elapsed algorithm iterations, check that the
+-- limit is not exceeded and call `pmcheckGuards`
+pmcheckGuardsI :: [PatVec] -> ValVec -> PmM Triple
+pmcheckGuardsI gvs vva = incrCheckPmIterDs >> pmcheckGuards gvs vva
+{-# INLINE pmcheckGuardsI #-}
+
+-- | Increase the counter for elapsed algorithm iterations, check that the
+-- limit is not exceeded and call `pmcheckHd`
+pmcheckHdI :: Pattern -> PatVec -> [PatVec] -> ValAbs -> ValVec -> PmM Triple
+pmcheckHdI p ps guards va vva = incrCheckPmIterDs >>
+                                  pmcheckHd p ps guards va vva
+{-# INLINE pmcheckHdI #-}
+
+-- | Matching function: Check simultaneously a clause (takes separately the
+-- patterns and the list of guards) for exhaustiveness, redundancy and
+-- inaccessibility.
+pmcheck :: PatVec -> [PatVec] -> ValVec -> PmM Triple
+pmcheck [] guards vva@(ValVec [] _)
+  | null guards = return (True, [], False)
+  | otherwise   = pmcheckGuardsI guards vva
+
+-- Guard
+pmcheck (p@(PmGrd pv e) : ps) guards vva@(ValVec vas delta)
+    -- short-circuit if the guard pattern is useless.
+    -- we just have two possible outcomes: fail here or match and recurse
+    -- none of the two contains any useful information about the failure
+    -- though. So just have these two cases but do not do all the boilerplate
+  | isFakeGuard pv e = forces . mkCons vva <$> pmcheckI ps guards vva
+  | otherwise = do
+      y <- mkPmId (pmPatType p)
+      let tm_state = extendSubst y e (delta_tm_cs delta)
+          delta'   = delta { delta_tm_cs = tm_state }
+      utail <$> pmcheckI (pv ++ ps) guards (ValVec (PmVar y : vas) delta')
+
+pmcheck [] _ (ValVec (_:_) _) = panic "pmcheck: nil-cons"
+pmcheck (_:_) _ (ValVec [] _) = panic "pmcheck: cons-nil"
+
+pmcheck (p:ps) guards (ValVec (va:vva) delta)
+  = pmcheckHdI p ps guards va (ValVec vva delta)
+
+-- | Check the list of guards
+pmcheckGuards :: [PatVec] -> ValVec -> PmM Triple
+pmcheckGuards []       vva = return (False, [vva], False)
+pmcheckGuards (gv:gvs) vva = do
+  (cs,  vsa,  ds ) <- pmcheckI gv [] vva
+  (css, vsas, dss) <- runMany (pmcheckGuardsI gvs) vsa
+  return (cs || css, vsas, ds || dss)
+
+-- | Worker function: Implements all cases described in the paper for all three
+-- functions (`covered`, `uncovered` and `divergent`) apart from the `Guard`
+-- cases which are handled by `pmcheck`
+pmcheckHd :: Pattern -> PatVec -> [PatVec] -> ValAbs -> ValVec -> PmM Triple
+
+-- Var
+pmcheckHd (PmVar x) ps guards va (ValVec vva delta)
+  | Just tm_state <- solveOneEq (delta_tm_cs delta)
+                                (PmExprVar (idName x), vaToPmExpr va)
+  = ucon va <$> pmcheckI ps guards (ValVec vva (delta {delta_tm_cs = tm_state}))
+  | otherwise = return (False, [], False)
+
+-- ConCon
+pmcheckHd ( p@(PmCon {pm_con_con = c1, pm_con_args = args1})) ps guards
+          (va@(PmCon {pm_con_con = c2, pm_con_args = args2})) (ValVec vva delta)
+  | c1 /= c2  = return (False, [ValVec (va:vva) delta], False)
+  | otherwise = kcon c1 (pm_con_arg_tys p) (pm_con_tvs p) (pm_con_dicts p)
+                <$> pmcheckI (args1 ++ ps) guards (ValVec (args2 ++ vva) delta)
+
+-- LitLit
+pmcheckHd (PmLit l1) ps guards (va@(PmLit l2)) vva = case eqPmLit l1 l2 of
+  True  -> ucon va <$> pmcheckI ps guards vva
+  False -> return $ ucon va (False, [vva], False)
+
+-- ConVar
+pmcheckHd (p@(PmCon { pm_con_con = con })) ps guards
+          (PmVar x) (ValVec vva delta) = do
+  cons_cs  <- mapM (mkOneConFull x) (allConstructors con)
+  inst_vsa <- flip concatMapM cons_cs $ \(va, tm_ct, ty_cs) -> do
+    let ty_state = ty_cs `unionBags` delta_ty_cs delta -- not actually a state
+    sat_ty <- if isEmptyBag ty_cs then return True
+                                  else tyOracle ty_state
+    return $ case (sat_ty, solveOneEq (delta_tm_cs delta) tm_ct) of
+      (True, Just tm_state) -> [ValVec (va:vva) (MkDelta ty_state tm_state)]
+      _ty_or_tm_failed      -> []
+
+  force_if (canDiverge (idName x) (delta_tm_cs delta)) <$>
+    runMany (pmcheckI (p:ps) guards) inst_vsa
+
+-- LitVar
+pmcheckHd (p@(PmLit l)) ps guards (PmVar x) (ValVec vva delta)
+  = force_if (canDiverge (idName x) (delta_tm_cs delta)) <$>
+      mkUnion non_matched <$>
+        case solveOneEq (delta_tm_cs delta) (mkPosEq x l) of
+          Just tm_state -> pmcheckHdI p ps guards (PmLit l) $
+                             ValVec vva (delta {delta_tm_cs = tm_state})
+          Nothing       -> return (False, [], False)
+  where
+    us | Just tm_state <- solveOneEq (delta_tm_cs delta) (mkNegEq x l)
+       = [ValVec (PmNLit x [l] : vva) (delta { delta_tm_cs = tm_state })]
+       | otherwise = []
+
+    non_matched = (False, us, False)
+
+-- LitNLit
+pmcheckHd (p@(PmLit l)) ps guards
+          (PmNLit { pm_lit_id = x, pm_lit_not = lits }) (ValVec vva delta)
+  | all (not . eqPmLit l) lits
+  , Just tm_state <- solveOneEq (delta_tm_cs delta) (mkPosEq x l)
+    -- Both guards check the same so it would be sufficient to have only
+    -- the second one. Nevertheless, it is much cheaper to check whether
+    -- the literal is in the list so we check it first, to avoid calling
+    -- the term oracle (`solveOneEq`) if possible
+  = mkUnion non_matched <$>
+      pmcheckHdI p ps guards (PmLit l)
+                (ValVec vva (delta { delta_tm_cs = tm_state }))
+  | otherwise = return non_matched
+  where
+    us | Just tm_state <- solveOneEq (delta_tm_cs delta) (mkNegEq x l)
+       = [ValVec (PmNLit x (l:lits) : vva) (delta { delta_tm_cs = tm_state })]
+       | otherwise = []
+
+    non_matched = (False, us, False)
+
+-- ----------------------------------------------------------------------------
+-- The following three can happen only in cases like #322 where constructors
+-- and overloaded literals appear in the same match. The general strategy is
+-- to replace the literal (positive/negative) by a variable and recurse. The
+-- fact that the variable is equal to the literal is recorded in `delta` so
+-- no information is lost
+
+-- LitCon
+pmcheckHd (PmLit l) ps guards (va@(PmCon {})) (ValVec vva delta)
+  = do y <- mkPmId (pmPatType va)
+       let tm_state = extendSubst y (PmExprLit l) (delta_tm_cs delta)
+           delta'   = delta { delta_tm_cs = tm_state }
+       pmcheckHdI (PmVar y) ps guards va (ValVec vva delta')
+
+-- ConLit
+pmcheckHd (p@(PmCon {})) ps guards (PmLit l) (ValVec vva delta)
+  = do y <- mkPmId (pmPatType p)
+       let tm_state = extendSubst y (PmExprLit l) (delta_tm_cs delta)
+           delta'   = delta { delta_tm_cs = tm_state }
+       pmcheckHdI p ps guards (PmVar y) (ValVec vva delta')
+
+-- ConNLit
+pmcheckHd (p@(PmCon {})) ps guards (PmNLit { pm_lit_id = x }) vva
+  = pmcheckHdI p ps guards (PmVar x) vva
+
+-- Impossible: handled by pmcheck
+pmcheckHd (PmGrd {}) _ _ _ _ = panic "pmcheckHd: Guard"
+
+-- ----------------------------------------------------------------------------
+-- * Utilities for main checking
+
+-- | Take the tail of all value vector abstractions in the uncovered set
+utail :: Triple -> Triple
+utail (cs, vsa, ds) = (cs, vsa', ds)
+  where vsa' = [ ValVec vva delta | ValVec (_:vva) delta <- vsa ]
+
+-- | Prepend a value abstraction to all value vector abstractions in the
+-- uncovered set
+ucon :: ValAbs -> Triple -> Triple
+ucon va (cs, vsa, ds) = (cs, vsa', ds)
+  where vsa' = [ ValVec (va:vva) delta | ValVec vva delta <- vsa ]
+
+-- | Given a data constructor of arity `a` and an uncovered set containing
+-- value vector abstractions of length `(a+n)`, pass the first `n` value
+-- abstractions to the constructor (Hence, the resulting value vector
+-- abstractions will have length `n+1`)
+kcon :: DataCon -> [Type] -> [TyVar] -> [EvVar] -> Triple -> Triple
+kcon con arg_tys ex_tvs dicts (cs, vsa, ds)
+  = (cs, [ ValVec (va:vva) delta
+         | ValVec vva' delta <- vsa
+         , let (args, vva) = splitAt n vva'
+         , let va = PmCon { pm_con_con     = con
+                          , pm_con_arg_tys = arg_tys
+                          , pm_con_tvs     = ex_tvs
+                          , pm_con_dicts   = dicts
+                          , pm_con_args    = args } ]
+       , ds)
+  where n = dataConSourceArity con
+
+-- | Get the union of two covered, uncovered and divergent value set
+-- abstractions. Since the covered and divergent sets are represented by a
+-- boolean, union means computing the logical or (at least one of the two is
+-- non-empty).
+mkUnion :: Triple -> Triple -> Triple
+mkUnion (cs1, vsa1, ds1) (cs2, vsa2, ds2)
+  = (cs1 || cs2, vsa1 ++ vsa2, ds1 || ds2)
+
+-- | Add a value vector abstraction to a value set abstraction (uncovered).
+mkCons :: ValVec -> Triple -> Triple
+mkCons vva (cs, vsa, ds) = (cs, vva:vsa, ds)
+
+-- | Set the divergent set to not empty
+forces :: Triple -> Triple
+forces (cs, us, _) = (cs, us, True)
+
+-- | Set the divergent set to non-empty if the flag is `True`
+force_if :: Bool -> Triple -> Triple
+force_if True  (cs,us,_) = (cs,us,True)
+force_if False triple    = triple
+
+-- ----------------------------------------------------------------------------
+-- * Propagation of term constraints inwards when checking nested matches
+
+{- Note [Type and Term Equality Propagation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When checking a match it would be great to have all type and term information
+available so we can get more precise results. For this reason we have functions
+`addDictsDs' and `addTmCsDs' in DsMonad that store in the environment type and
+term constraints (respectively) as we go deeper.
+
+The type constraints we propagate inwards are collected by `collectEvVarsPats'
+in HsPat.hs. This handles bug #4139 ( see example
+  https://ghc.haskell.org/trac/ghc/attachment/ticket/4139/GADTbug.hs )
+where this is needed.
+
+For term equalities we do less, we just generate equalities for HsCase. For
+example we accurately give 2 redundancy warnings for the marked cases:
+
+f :: [a] -> Bool
+f x = case x of
+
+  []    -> case x of        -- brings (x ~ []) in scope
+             []    -> True
+             (_:_) -> False -- can't happen
+
+  (_:_) -> case x of        -- brings (x ~ (_:_)) in scope
+             (_:_) -> True
+             []    -> False -- can't happen
+
+Functions `genCaseTmCs1' and `genCaseTmCs2' are responsible for generating
+these constraints.
+-}
+
+-- | Generate equalities when checking a case expression:
+--     case x of { p1 -> e1; ... pn -> en }
+-- When we go deeper to check e.g. e1 we record two equalities:
+-- (x ~ y), where y is the initial uncovered when checking (p1; .. ; pn)
+-- and (x ~ p1).
+genCaseTmCs2 :: Maybe (LHsExpr Id) -- Scrutinee
+             -> [Pat Id]           -- LHS       (should have length 1)
+             -> [Id]               -- MatchVars (should have length 1)
+             -> DsM (Bag SimpleEq)
+genCaseTmCs2 Nothing _ _ = return emptyBag
+genCaseTmCs2 (Just scr) [p] [var] = do
+  fam_insts <- dsGetFamInstEnvs
+  [e] <- map vaToPmExpr . coercePatVec <$> translatePat fam_insts p
+  let scr_e = lhsExprToPmExpr scr
+  return $ listToBag [(var, e), (var, scr_e)]
+genCaseTmCs2 _ _ _ = panic "genCaseTmCs2: HsCase"
+
+-- | Generate a simple equality when checking a case expression:
+--     case x of { matches }
+-- When checking matches we record that (x ~ y) where y is the initial
+-- uncovered. All matches will have to satisfy this equality.
+genCaseTmCs1 :: Maybe (LHsExpr Id) -> [Id] -> Bag SimpleEq
+genCaseTmCs1 Nothing     _    = emptyBag
+genCaseTmCs1 (Just scr) [var] = unitBag (var, lhsExprToPmExpr scr)
+genCaseTmCs1 _ _              = panic "genCaseTmCs1: HsCase"
+
+{- Note [Literals in PmPat]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Instead of translating a literal to a variable accompanied with a guard, we
+treat them like constructor patterns. The following example from
+"./libraries/base/GHC/IO/Encoding.hs" shows why:
+
+mkTextEncoding' :: CodingFailureMode -> String -> IO TextEncoding
+mkTextEncoding' cfm enc = case [toUpper c | c <- enc, c /= '-'] of
+    "UTF8"    -> return $ UTF8.mkUTF8 cfm
+    "UTF16"   -> return $ UTF16.mkUTF16 cfm
+    "UTF16LE" -> return $ UTF16.mkUTF16le cfm
+    ...
+
+Each clause gets translated to a list of variables with an equal number of
+guards. For every guard we generate two cases (equals True/equals False) which
+means that we generate 2^n cases to feed the oracle with, where n is the sum of
+the length of all strings that appear in the patterns. For this particular
+example this means over 2^40 cases. Instead, by representing them like with
+constructor we get the following:
+  1. We exploit the common prefix with our representation of VSAs
+  2. We prune immediately non-reachable cases
+     (e.g. False == (x == "U"), True == (x == "U"))
+
+Note [Translating As Patterns]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Instead of translating x@p as:  x (p <- x)
+we instead translate it as:     p (x <- coercePattern p)
+for performance reasons. For example:
+
+  f x@True  = 1
+  f y@False = 2
+
+Gives the following with the first translation:
+
+  x |> {x == False, x == y, y == True}
+
+If we use the second translation we get an empty set, independently of the
+oracle. Since the pattern `p' may contain guard patterns though, it cannot be
+used as an expression. That's why we call `coercePatVec' to drop the guard and
+`vaToPmExpr' to transform the value abstraction to an expression in the
+guard pattern (value abstractions are a subset of expressions). We keep the
+guards in the first pattern `p' though.
+
+
+%************************************************************************
+%*                                                                      *
+      Pretty printing of exhaustiveness/redundancy check warnings
+%*                                                                      *
+%************************************************************************
+-}
+
+-- | Check whether any part of pattern match checking is enabled (does not
+-- matter whether it is the redundancy check or the exhaustiveness check).
+isAnyPmCheckEnabled :: DynFlags -> DsMatchContext -> Bool
+isAnyPmCheckEnabled dflags (DsMatchContext kind _loc)
+  = wopt Opt_WarnOverlappingPatterns dflags || exhaustive dflags kind
+
+instance Outputable ValVec where
+  ppr (ValVec vva delta)
+    = let (residual_eqs, subst) = wrapUpTmState (delta_tm_cs delta)
+          vector                = substInValAbs subst vva
+      in  ppr_uncovered (vector, residual_eqs)
+
+-- | Apply a term substitution to a value vector abstraction. All VAs are
+-- transformed to PmExpr (used only before pretty printing).
+substInValAbs :: PmVarEnv -> [ValAbs] -> [PmExpr]
+substInValAbs subst = map (exprDeepLookup subst . vaToPmExpr)
+
+-- | Wrap up the term oracle's state once solving is complete. Drop any
+-- information about unhandled constraints (involving HsExprs) and flatten
+-- (height 1) the substitution.
+wrapUpTmState :: TmState -> ([ComplexEq], PmVarEnv)
+wrapUpTmState (residual, (_, subst)) = (residual, flattenPmVarEnv subst)
+
+-- | Issue all the warnings (coverage, exhaustiveness, inaccessibility)
+dsPmWarn :: DynFlags -> DsMatchContext -> PmResult -> DsM ()
+dsPmWarn dflags ctx@(DsMatchContext kind loc) pm_result
+  = when (flag_i || flag_u) $ do
+      let exists_r = flag_i && notNull redundant
+          exists_i = flag_i && notNull inaccessible
+          exists_u = flag_u && notNull uncovered
+      when exists_r $ forM_ redundant $ \(L l q) -> do
+        putSrcSpanDs l (warnDs (Reason Opt_WarnOverlappingPatterns)
+                               (pprEqn q "is redundant"))
+      when exists_i $ forM_ inaccessible $ \(L l q) -> do
+        putSrcSpanDs l (warnDs (Reason Opt_WarnOverlappingPatterns)
+                               (pprEqn q "has inaccessible right hand side"))
+      when exists_u $
+        putSrcSpanDs loc (warnDs flag_u_reason (pprEqns uncovered))
+  where
+    (redundant, uncovered, inaccessible) = pm_result
+
+    flag_i = wopt Opt_WarnOverlappingPatterns dflags
+    flag_u = exhaustive dflags kind
+    flag_u_reason = maybe NoReason Reason (exhaustiveWarningFlag kind)
+
+    -- Print a single clause (for redundant/with-inaccessible-rhs)
+    pprEqn q txt = pp_context True ctx (text txt) $ \f -> ppr_eqn f kind q
+
+    -- Print several clauses (for uncovered clauses)
+    pprEqns qs = pp_context False ctx (text "are non-exhaustive") $ \_ ->
+      case qs of -- See #11245
+           [ValVec [] _]
+                    -> text "Guards do not cover entire pattern space"
+           _missing -> let us = map ppr qs
+                       in  hang (text "Patterns not matched:") 4
+                                (vcat (take maximum_output us) $$ dots us)
+
+-- | Issue a warning when the predefined number of iterations is exceeded
+-- for the pattern match checker
+warnPmIters :: DynFlags -> DsMatchContext -> PmM ()
+warnPmIters dflags (DsMatchContext kind loc)
+  = when (flag_i || flag_u) $ do
+      iters <- maxPmCheckIterations <$> getDynFlags
+      putSrcSpanDs loc (warnDs NoReason (msg iters))
+  where
+    ctxt   = pprMatchContext kind
+    msg is = fsep [ text "Pattern match checker exceeded"
+                  , parens (ppr is), text "iterations in", ctxt <> dot
+                  , text "(Use -fmax-pmcheck-iterations=n"
+                  , text "to set the maximun number of iterations to n)" ]
+
+    flag_i = wopt Opt_WarnOverlappingPatterns dflags
+    flag_u = exhaustive dflags kind
+
+dots :: [a] -> SDoc
+dots qs | qs `lengthExceeds` maximum_output = text "..."
+        | otherwise                         = empty
+
+-- | Check whether the exhaustiveness checker should run (exhaustiveness only)
+exhaustive :: DynFlags -> HsMatchContext id -> Bool
+exhaustive  dflags = maybe False (`wopt` dflags) . exhaustiveWarningFlag
+
+-- | Denotes whether an exhaustiveness check is supported, and if so,
+-- via which 'WarningFlag' it's controlled.
+-- Returns 'Nothing' if check is not supported.
+exhaustiveWarningFlag :: HsMatchContext id -> Maybe WarningFlag
+exhaustiveWarningFlag (FunRhs {})   = Just Opt_WarnIncompletePatterns
+exhaustiveWarningFlag CaseAlt       = Just Opt_WarnIncompletePatterns
+exhaustiveWarningFlag IfAlt         = Nothing
+exhaustiveWarningFlag LambdaExpr    = Just Opt_WarnIncompleteUniPatterns
+exhaustiveWarningFlag PatBindRhs    = Just Opt_WarnIncompleteUniPatterns
+exhaustiveWarningFlag ProcExpr      = Just Opt_WarnIncompleteUniPatterns
+exhaustiveWarningFlag RecUpd        = Just Opt_WarnIncompletePatternsRecUpd
+exhaustiveWarningFlag ThPatSplice   = Nothing
+exhaustiveWarningFlag PatSyn        = Nothing
+exhaustiveWarningFlag ThPatQuote    = Nothing
+exhaustiveWarningFlag (StmtCtxt {}) = Nothing -- Don't warn about incomplete patterns
+                                       -- in list comprehensions, pattern guards
+                                       -- etc. They are often *supposed* to be
+                                       -- incomplete
+
+-- True <==> singular
+pp_context :: Bool -> DsMatchContext -> SDoc -> ((SDoc -> SDoc) -> SDoc) -> SDoc
+pp_context singular (DsMatchContext kind _loc) msg rest_of_msg_fun
+  = vcat [text txt <+> msg,
+          sep [ text "In" <+> ppr_match <> char ':'
+              , nest 4 (rest_of_msg_fun pref)]]
+  where
+    txt | singular  = "Pattern match"
+        | otherwise = "Pattern match(es)"
+
+    (ppr_match, pref)
+        = case kind of
+             FunRhs fun -> (pprMatchContext kind, \ pp -> ppr fun <+> pp)
+             _          -> (pprMatchContext kind, \ pp -> pp)
+
+ppr_pats :: HsMatchContext Name -> [Pat Id] -> SDoc
+ppr_pats kind pats
+  = sep [sep (map ppr pats), matchSeparator kind, text "..."]
+
+ppr_eqn :: (SDoc -> SDoc) -> HsMatchContext Name -> [LPat Id] -> SDoc
+ppr_eqn prefixF kind eqn = prefixF (ppr_pats kind (map unLoc eqn))
+
+ppr_constraint :: (SDoc,[PmLit]) -> SDoc
+ppr_constraint (var, lits) = var <+> text "is not one of"
+                                 <+> braces (pprWithCommas ppr lits)
+
+ppr_uncovered :: ([PmExpr], [ComplexEq]) -> SDoc
+ppr_uncovered (expr_vec, complex)
+  | null cs   = fsep vec -- there are no literal constraints
+  | otherwise = hang (fsep vec) 4 $
+                  text "where" <+> vcat (map ppr_constraint cs)
+  where
+    sdoc_vec = mapM pprPmExprWithParens expr_vec
+    (vec,cs) = runPmPprM sdoc_vec (filterComplex complex)
+
+-- | This variable shows the maximum number of lines of output generated for
+-- warnings. It will limit the number of patterns/equations displayed to
+-- maximum_output. (TODO: add command-line option?)
+maximum_output :: Int
+maximum_output = 4
+
+{- Note [Representation of Term Equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the paper, term constraints always take the form (x ~ e). Of course, a more
+general constraint of the form (e1 ~ e1) can always be transformed to an
+equivalent set of the former constraints, by introducing a fresh, intermediate
+variable: { y ~ e1, y ~ e1 }. Yet, implementing this representation gave rise
+to #11160 (incredibly bad performance for literal pattern matching). Two are
+the main sources of this problem (the actual problem is how these two interact
+with each other):
+
+1. Pattern matching on literals generates twice as many constraints as needed.
+   Consider the following (tests/ghci/should_run/ghcirun004):
+
+    foo :: Int -> Int
+    foo 1    = 0
+    ...
+    foo 5000 = 4999
+
+   The covered and uncovered set *should* look like:
+     U0 = { x |> {} }
+
+     C1  = { 1  |> { x ~ 1 } }
+     U1  = { x  |> { False ~ (x ~ 1) } }
+     ...
+     C10 = { 10 |> { False ~ (x ~ 1), .., False ~ (x ~ 9), x ~ 10 } }
+     U10 = { x  |> { False ~ (x ~ 1), .., False ~ (x ~ 9), False ~ (x ~ 10) } }
+     ...
+
+     If we replace { False ~ (x ~ 1) } with { y ~ False, y ~ (x ~ 1) }
+     we get twice as many constraints. Also note that half of them are just the
+     substitution [x |-> False].
+
+2. The term oracle (`tmOracle` in deSugar/TmOracle) uses equalities of the form
+   (x ~ e) as substitutions [x |-> e]. More specifically, function
+   `extendSubstAndSolve` applies such substitutions in the residual constraints
+   and partitions them in the affected and non-affected ones, which are the new
+   worklist. Essentially, this gives quadradic behaviour on the number of the
+   residual constraints. (This would not be the case if the term oracle used
+   mutable variables but, since we use it to handle disjunctions on value set
+   abstractions (`Union` case), we chose a pure, incremental interface).
+
+Now the problem becomes apparent (e.g. for clause 300):
+  * Set U300 contains 300 substituting constraints [y_i |-> False] and 300
+    constraints that we know that will not reduce (stay in the worklist).
+  * To check for consistency, we apply the substituting constraints ONE BY ONE
+    (since `tmOracle` is called incrementally, it does not have all of them
+    available at once). Hence, we go through the (non-progressing) constraints
+    over and over, achieving over-quadradic behaviour.
+
+If instead we allow constraints of the form (e ~ e),
+  * All uncovered sets Ui contain no substituting constraints and i
+    non-progressing constraints of the form (False ~ (x ~ lit)) so the oracle
+    behaves linearly.
+  * All covered sets Ci contain exactly (i-1) non-progressing constraints and
+    a single substituting constraint. So the term oracle goes through the
+    constraints only once.
+
+The performance improvement becomes even more important when more arguments are
+involved.
+-}

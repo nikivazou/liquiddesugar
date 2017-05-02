@@ -8,25 +8,26 @@ Matching guarded right-hand-sides (GRHSs)
 
 {-# LANGUAGE CPP #-}
 
-module Language.Haskell.Liquid.Desugar.DsGRHSs ( dsGuarded, dsGRHSs, dsGRHS ) where
+module DsGRHSs ( dsGuarded, dsGRHSs, dsGRHS, isTrueLHsExpr ) where
 
--- #include "HsVersions.h"
+#include "HsVersions.h"
 
-import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr  ( dsLExpr, dsLocalBinds )
-import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.Match   ( matchSinglePat )
-import Prelude hiding (error)
+import {-# SOURCE #-} DsExpr  ( dsLExpr, dsLocalBinds )
+import {-# SOURCE #-} Match   ( matchSinglePat )
+
 import HsSyn
 import MkCore
 import CoreSyn
 import Var
-import Type
 
 import DsMonad
-import Language.Haskell.Liquid.Desugar.DsUtils
+import DsUtils
 import TysWiredIn
 import PrelNames
+import Type   ( Type )
 import Module
 import Name
+import Util
 import SrcLoc
 import Outputable
 
@@ -56,8 +57,8 @@ dsGRHSs :: HsMatchContext Name -> [Pat Id]      -- These are to build a MatchCon
         -> GRHSs Id (LHsExpr Id)                -- Guarded RHSs
         -> Type                                 -- Type of RHS
         -> DsM MatchResult
-dsGRHSs hs_ctx _ (GRHSs grhss binds) rhs_ty
-  = -- ASSERT( notNull grhss )
+dsGRHSs hs_ctx _ (GRHSs grhss (L _ binds)) rhs_ty
+  = ASSERT( notNull grhss )
     do { match_results <- mapM (dsGRHS hs_ctx rhs_ty) grhss
        ; let match_result1 = foldr1 combineMatchResults match_results
              match_result2 = adjustMatchResultDs (dsLocalBinds binds) match_result1
@@ -105,7 +106,7 @@ matchGuards (BodyStmt expr _ _ _ : stmts) ctx rhs rhs_ty = do
     pred_expr <- dsLExpr expr
     return (mkGuardedMatchResult pred_expr match_result)
 
-matchGuards (LetStmt binds : stmts) ctx rhs rhs_ty = do
+matchGuards (LetStmt (L _ binds) : stmts) ctx rhs rhs_ty = do
     match_result <- matchGuards stmts ctx rhs rhs_ty
     return (adjustMatchResultDs (dsLocalBinds binds) match_result)
         -- NB the dsLet occurs inside the match_result
@@ -113,7 +114,7 @@ matchGuards (LetStmt binds : stmts) ctx rhs rhs_ty = do
         --         so we can't desugar the bindings without the
         --         body expression in hand
 
-matchGuards (BindStmt pat bind_rhs _ _ : stmts) ctx rhs rhs_ty = do
+matchGuards (BindStmt pat bind_rhs _ _ _ : stmts) ctx rhs rhs_ty = do
     match_result <- matchGuards stmts ctx rhs rhs_ty
     core_rhs <- dsLExpr bind_rhs
     matchSinglePat core_rhs (StmtCtxt ctx) pat rhs_ty match_result
@@ -122,6 +123,8 @@ matchGuards (LastStmt  {} : _) _ _ _ = panic "matchGuards LastStmt"
 matchGuards (ParStmt   {} : _) _ _ _ = panic "matchGuards ParStmt"
 matchGuards (TransStmt {} : _) _ _ _ = panic "matchGuards TransStmt"
 matchGuards (RecStmt   {} : _) _ _ _ = panic "matchGuards RecStmt"
+matchGuards (ApplicativeStmt {} : _) _ _ _ =
+  panic "matchGuards ApplicativeLastStmt"
 
 isTrueLHsExpr :: LHsExpr Id -> Maybe (CoreExpr -> DsM CoreExpr)
 
@@ -131,13 +134,14 @@ isTrueLHsExpr :: LHsExpr Id -> Maybe (CoreExpr -> DsM CoreExpr)
 --        * Trivial wappings of these
 -- The arguments to Just are any HsTicks that we have found,
 -- because we still want to tick then, even it they are aways evaluted.
-isTrueLHsExpr (L _ (HsVar v)) |  v `hasKey` otherwiseIdKey
-                              || v `hasKey` getUnique trueDataConId
-                                      = Just return
+isTrueLHsExpr (L _ (HsVar (L _ v))) |  v `hasKey` otherwiseIdKey
+                                    || v `hasKey` getUnique trueDataConId
+                                            = Just return
         -- trueDataConId doesn't have the same unique as trueDataCon
 isTrueLHsExpr (L _ (HsTick tickish e))
     | Just ticks <- isTrueLHsExpr e
-    = Just (\x -> ticks x >>= return .  (Tick tickish))
+    = Just (\x -> do wrapped <- ticks x
+                     return (Tick tickish wrapped))
    -- This encodes that the result is constant True for Hpc tick purposes;
    -- which is specifically what isTrueLHsExpr is trying to find out.
 isTrueLHsExpr (L _ (HsBinTick ixT _ e))

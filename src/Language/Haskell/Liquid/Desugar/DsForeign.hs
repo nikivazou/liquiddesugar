@@ -8,18 +8,10 @@ Desugaring foreign declarations (see also DsCCall).
 
 {-# LANGUAGE CPP #-}
 
-module Language.Haskell.Liquid.Desugar.DsForeign ( dsForeigns
-                 , dsForeigns'
-                 , dsFImport, dsCImport, dsFCall, dsPrimCall
-                 , dsFExport, dsFExportDynamic, mkFExportCBits
-                 , toCType
-                 , foreignExportInitialiser
-                 ) where
+module DsForeign ( dsForeigns ) where
 
--- #include "HsVersions.h"
+#include "HsVersions.h"
 import TcRnMonad        -- temp
-import Prelude hiding (error)
-import TypeRep
 
 import CoreSyn
 
@@ -55,6 +47,7 @@ import Platform
 import Config
 import OrdList
 import Pair
+import Util
 import Hooks
 
 import Data.Maybe
@@ -100,14 +93,15 @@ dsForeigns' fos = do
   where
    do_ldecl (L loc decl) = putSrcSpanDs loc (do_decl decl)
 
-   do_decl (ForeignImport id _ co spec) = do
+   do_decl (ForeignImport { fd_name = id, fd_co = co, fd_fi = spec }) = do
       traceIf (text "fi start" <+> ppr id)
-      (bs, h, c) <- dsFImport (unLoc id) co spec
+      let id' = unLoc id
+      (bs, h, c) <- dsFImport id' co spec
       traceIf (text "fi end" <+> ppr id)
       return (h, c, [], bs)
 
-   do_decl (ForeignExport (L _ id) _ co
-                          (CExport (L _ (CExportStatic ext_nm cconv)) _)) = do
+   do_decl (ForeignExport { fd_name = L _ id, fd_co = co
+                          , fd_fe = CExport (L _ (CExportStatic _ ext_nm cconv)) _ }) = do
       (h, c, _, _) <- dsFExport id co ext_nm cconv False
       return (h, c, [id], [])
 
@@ -141,9 +135,8 @@ dsFImport :: Id
           -> Coercion
           -> ForeignImport
           -> DsM ([Binding], SDoc, SDoc)
-dsFImport id co (CImport cconv safety mHeader spec _) = do
-    (ids, h, c) <- dsCImport id co spec (unLoc cconv) (unLoc safety) mHeader
-    return (ids, h, c)
+dsFImport id co (CImport cconv safety mHeader spec _) =
+    dsCImport id co spec (unLoc cconv) (unLoc safety) mHeader
 
 dsCImport :: Id
           -> Coercion
@@ -152,20 +145,22 @@ dsCImport :: Id
           -> Safety
           -> Maybe Header
           -> DsM ([Binding], SDoc, SDoc)
-dsCImport id co (CLabel _) _ _ _ = do
-   -- dflags <- getDynFlags
-   -- let ty = pFst $ coercionKind co
-   --     fod = case tyConAppTyCon_maybe (dropForAlls ty) of
-   --           Just tycon
-   --            | tyConUnique tycon == funPtrTyConKey ->
-   --               IsFunction
-   --           _ -> IsData
-   -- (resTy, foRhs) <- resultWrapper ty
-   -- ASSERT(fromJust resTy `eqType` addrPrimTy)    -- typechecker ensures this
-   let rhs = let x = x in x -- foRhs (Lit (MachLabel cid stdcall_info fod))
-   let rhs' = Cast rhs co
-   -- let stdcall_info = fun_type_arg_stdcall_info dflags cconv ty
-   return ([(id, rhs')], empty, empty)
+dsCImport id co (CLabel cid) cconv _ _ = do
+   dflags <- getDynFlags
+   let ty  = pFst $ coercionKind co
+       fod = case tyConAppTyCon_maybe (dropForAlls ty) of
+             Just tycon
+              | tyConUnique tycon == funPtrTyConKey ->
+                 IsFunction
+             _ -> IsData
+   (resTy, foRhs) <- resultWrapper ty
+   ASSERT(fromJust resTy `eqType` addrPrimTy)    -- typechecker ensures this
+    let
+        rhs = foRhs (Lit (MachLabel cid stdcall_info fod))
+        rhs' = Cast rhs co
+        stdcall_info = fun_type_arg_stdcall_info dflags cconv ty
+    in
+    return ([(id, rhs')], empty, empty)
 
 dsCImport id co (CFunction target) cconv@PrimCallConv safety _
   = dsPrimCall id co (CCall (CCallSpec target cconv safety))
@@ -177,16 +172,16 @@ dsCImport id co CWrapper cconv _ _
 -- For stdcall labels, if the type was a FunPtr or newtype thereof,
 -- then we need to calculate the size of the arguments in order to add
 -- the @n suffix to the label.
--- fun_type_arg_stdcall_info :: DynFlags -> CCallConv -> Type -> Maybe Int
--- fun_type_arg_stdcall_info dflags StdCallConv ty
---   | Just (tc,[arg_ty]) <- splitTyConApp_maybe ty,
---     tyConUnique tc == funPtrTyConKey
---   = let
---        (_tvs,sans_foralls)        = tcSplitForAllTys arg_ty
---        (fe_arg_tys, _orig_res_ty) = tcSplitFunTys sans_foralls
---     in Just $ sum (map (widthInBytes . typeWidth . typeCmmType dflags . getPrimTyOf) fe_arg_tys)
--- fun_type_arg_stdcall_info _ _other_conv _
---   = Nothing
+fun_type_arg_stdcall_info :: DynFlags -> CCallConv -> Type -> Maybe Int
+fun_type_arg_stdcall_info dflags StdCallConv ty
+  | Just (tc,[arg_ty]) <- splitTyConApp_maybe ty,
+    tyConUnique tc == funPtrTyConKey
+  = let
+       (bndrs, _) = tcSplitPiTys arg_ty
+       fe_arg_tys = mapMaybe binderRelevantType_maybe bndrs
+    in Just $ sum (map (widthInBytes . typeWidth . typeCmmType dflags . getPrimTyOf) fe_arg_tys)
+fun_type_arg_stdcall_info _ _other_conv _
+  = Nothing
 
 {-
 ************************************************************************
@@ -200,9 +195,13 @@ dsFCall :: Id -> Coercion -> ForeignCall -> Maybe Header
         -> DsM ([(Id, Expr TyVar)], SDoc, SDoc)
 dsFCall fn_id co fcall mDeclHeader = do
     let
-        ty                   = pFst $ coercionKind co
-        (tvs, fun_ty)        = tcSplitForAllTys ty
-        (arg_tys, io_res_ty) = tcSplitFunTys fun_ty
+        ty                     = pFst $ coercionKind co
+        (all_bndrs, io_res_ty) = tcSplitPiTys ty
+        (named_bndrs, arg_tys) = partitionBindersIntoBinders all_bndrs
+        tvs                    = ASSERT( fst (span isNamedBinder all_bndrs)
+                                         `equalLength` named_bndrs )
+                                   -- ensure that the named binders all come first
+                                 map (binderVar "dsFCall") named_bndrs
                 -- Must use tcSplit* functions because we want to
                 -- see that (IO t) in the corner
 
@@ -220,13 +219,18 @@ dsFCall fn_id co fcall mDeclHeader = do
     dflags <- getDynFlags
     (fcall', cDoc) <-
               case fcall of
-              CCall (CCallSpec (StaticTarget cName mPackageKey isFun) CApiConv safety) ->
+              CCall (CCallSpec (StaticTarget _ cName mUnitId isFun)
+                               CApiConv safety) ->
                do wrapperName <- mkWrapperName "ghc_wrapper" (unpackFS cName)
-                  let fcall' = CCall (CCallSpec (StaticTarget wrapperName mPackageKey True) CApiConv safety)
+                  let fcall' = CCall (CCallSpec
+                                      (StaticTarget (unpackFS wrapperName)
+                                                    wrapperName mUnitId
+                                                    True)
+                                      CApiConv safety)
                       c = includes
                        $$ fun_proto <+> braces (cRet <> semi)
                       includes = vcat [ text "#include <" <> ftext h <> text ">"
-                                      | Header h <- nub headers ]
+                                      | Header _ h <- nub headers ]
                       fun_proto = cResType <+> pprCconv <+> ppr wrapperName <> parens argTypes
                       cRet
                        | isVoidRes =                   cCall
@@ -262,7 +266,7 @@ dsFCall fn_id co fcall mDeclHeader = do
                   return (fcall, empty)
     let
         -- Build the worker
-        worker_ty     = mkForAllTys tvs (mkFunTys (map idType work_arg_ids) ccall_result_ty)
+        worker_ty     = mkForAllTys named_bndrs (mkFunTys (map idType work_arg_ids) ccall_result_ty)
         the_ccall_app = mkFCall dflags ccall_uniq fcall' val_args ccall_result_ty
         work_rhs      = mkLams tvs (mkLams work_arg_ids the_ccall_app)
         work_id       = mkSysLocal (fsLit "$wccall") work_uniq worker_ty
@@ -296,11 +300,12 @@ dsPrimCall :: Id -> Coercion -> ForeignCall
 dsPrimCall fn_id co fcall = do
     let
         ty                   = pFst $ coercionKind co
-        (tvs, fun_ty)        = tcSplitForAllTys ty
-        (arg_tys, io_res_ty) = tcSplitFunTys fun_ty
+        (bndrs, io_res_ty)   = tcSplitPiTys ty
+        (tvs, arg_tys)       = partitionBinders bndrs
                 -- Must use tcSplit* functions because we want to
                 -- see that (IO t) in the corner
 
+    MASSERT( fst (span isNamedBinder bndrs) `equalLength` tvs )
     args <- newSysLocalsDs arg_tys
 
     ccall_uniq <- newUnique
@@ -347,9 +352,9 @@ dsFExport :: Id                 -- Either the exported Id,
 
 dsFExport fn_id co ext_name cconv isDyn = do
     let
-       ty                              = pSnd $ coercionKind co
-       (_tvs,sans_foralls)             = tcSplitForAllTys ty
-       (fe_arg_tys', orig_res_ty)      = tcSplitFunTys sans_foralls
+       ty                     = pSnd $ coercionKind co
+       (bndrs, orig_res_ty)   = tcSplitPiTys ty
+       fe_arg_tys'            = mapMaybe binderRelevantType_maybe bndrs
        -- We must use tcSplits here, because we want to see
        -- the (IO t) in the corner of the type!
        fe_arg_tys | isDyn     = tail fe_arg_tys'
@@ -411,6 +416,8 @@ dsFExportDynamic :: Id
                  -> CCallConv
                  -> DsM ([Binding], SDoc, SDoc)
 dsFExportDynamic id co0 cconv = do
+    MASSERT( fst (span isNamedBinder bndrs) `equalLength` tvs )
+      -- make sure that the named binders all come first
     fe_id <-  newSysLocalDs ty
     mod <- getModule
     dflags <- getDynFlags
@@ -429,7 +436,7 @@ dsFExportDynamic id co0 cconv = do
         export_ty     = mkFunTy stable_ptr_ty arg_ty
     bindIOId <- dsLookupGlobalId bindIOName
     stbl_value <- newSysLocalDs stable_ptr_ty
-    (h_code, c_code, typestring, args_size) <- dsFExport id (mkReflCo Representational export_ty) fe_nm cconv True
+    (h_code, c_code, typestring, args_size) <- dsFExport id (mkRepReflCo export_ty) fe_nm cconv True
     let
          {-
           The arguments to the external function which will
@@ -474,10 +481,11 @@ dsFExportDynamic id co0 cconv = do
 
  where
   ty                       = pFst (coercionKind co0)
-  (tvs,sans_foralls)       = tcSplitForAllTys ty
-  ([arg_ty], fn_res_ty)    = tcSplitFunTys sans_foralls
+  (bndrs, fn_res_ty)       = tcSplitPiTys ty
+  (tvs, [arg_ty])          = partitionBinders bndrs
   Just (io_tc, res_ty)     = tcSplitIOType_maybe fn_res_ty
         -- Must have an IO type; hence Just
+
 
 toCName :: DynFlags -> Id -> String
 toCName dflags i = showSDoc dflags (pprCode CStyle (ppr (idName i)))
@@ -532,7 +540,7 @@ mkFExportCBits dflags c_nm maybe_target arg_htys res_hty is_IO_res_ty cc
 
   arg_cname n stg_ty
         | libffi    = char '*' <> parens (stg_ty <> char '*') <>
-                      ptext (sLit "args") <> brackets (int (n-1))
+                      text "args" <> brackets (int (n-1))
         | otherwise = text ('a':show n)
 
   -- generate a libffi-style stub if this is a "wrapper" and libffi is enabled
@@ -578,7 +586,7 @@ mkFExportCBits dflags c_nm maybe_target arg_htys res_hty is_IO_res_ty cc
   -- Now we can cook up the prototype for the exported function.
   pprCconv = ccallConvAttribute cc
 
-  header_bits = ptext (sLit "extern") <+> fun_proto <> semi
+  header_bits = text "extern" <+> fun_proto <> semi
 
   fun_args
     | null aug_arg_info = text "void"
@@ -587,8 +595,8 @@ mkFExportCBits dflags c_nm maybe_target arg_htys res_hty is_IO_res_ty cc
 
   fun_proto
     | libffi
-      = ptext (sLit "void") <+> ftext c_nm <>
-          parens (ptext (sLit "void *cif STG_UNUSED, void* resp, void** args, void* the_stableptr"))
+      = text "void" <+> ftext c_nm <>
+          parens (text "void *cif STG_UNUSED, void* resp, void** args, void* the_stableptr")
     | otherwise
       = cResType <+> pprCconv <+> ftext c_nm <> parens fun_args
 
@@ -631,14 +639,14 @@ mkFExportCBits dflags c_nm maybe_target arg_htys res_hty is_IO_res_ty cc
     fun_proto  $$
     vcat
      [ lbrace
-     ,   ptext (sLit "Capability *cap;")
+     ,   text "Capability *cap;"
      ,   declareResult
      ,   declareCResult
      ,   text "cap = rts_lock();"
           -- create the application + perform it.
-     ,   ptext (sLit "rts_evalIO") <> parens (
+     ,   text "rts_evalIO" <> parens (
                 char '&' <> cap <>
-                ptext (sLit "rts_apply") <> parens (
+                text "rts_apply" <> parens (
                     cap <>
                     text "(HaskellObj)"
                  <> ptext (if is_IO_res_ty
@@ -649,15 +657,15 @@ mkFExportCBits dflags c_nm maybe_target arg_htys res_hty is_IO_res_ty cc
                 ) <+> comma
                <> text "&ret"
              ) <> semi
-     ,   ptext (sLit "rts_checkSchedStatus") <> parens (doubleQuotes (ftext c_nm)
+     ,   text "rts_checkSchedStatus" <> parens (doubleQuotes (ftext c_nm)
                                                 <> comma <> text "cap") <> semi
      ,   assignCResult
-     ,   ptext (sLit "rts_unlock(cap);")
+     ,   text "rts_unlock(cap);"
      ,   ppUnless res_hty_is_unit $
          if libffi
                   then char '*' <> parens (ffi_cResType <> char '*') <>
-                       ptext (sLit "resp = cret;")
-                  else ptext (sLit "return cret;")
+                       text "resp = cret;"
+                  else text "return cret;"
      , rbrace
      ]
 
@@ -667,7 +675,7 @@ foreignExportInitialiser hs_fn =
    -- Initialise foreign exports by registering a stable pointer from an
    -- __attribute__((constructor)) function.
    -- The alternative is to do this from stginit functions generated in
-   -- codeGen/CodeGen.lhs; however, stginit functions have a negative impact
+   -- codeGen/CodeGen.hs; however, stginit functions have a negative impact
    -- on binary sizes and link times because the static linker will think that
    -- all modules that are imported directly or indirectly are actually used by
    -- the program.
@@ -709,8 +717,8 @@ toCType = f False
            -- see if there is a C type associated with that constructor.
            -- Note that we aren't looking through type synonyms or
            -- anything, as it may be the synonym that is annotated.
-           | TyConApp tycon _ <- t
-           , Just (CType _ mHeader cType) <- tyConCType_maybe tycon
+           | Just tycon <- tyConAppTyConPicky_maybe t
+           , Just (CType _ mHeader (_,cType)) <- tyConCType_maybe tycon
               = (mHeader, ftext cType)
            -- If we don't know a C type for this type, then try looking
            -- through one layer of type synonym etc.
@@ -718,7 +726,7 @@ toCType = f False
               = f voidOK t'
            -- Otherwise we don't know the C type. If we are allowing
            -- void then return that; otherwise something has gone wrong.
-           | voidOK = (Nothing, ptext (sLit "void"))
+           | voidOK = (Nothing, text "void")
            | otherwise
               = pprPanic "toCType" (ppr t)
 
@@ -778,9 +786,9 @@ getPrimTyOf ty
   -- with a single primitive-typed argument (see TcType.legalFEArgTyCon).
   | otherwise =
   case splitDataProductType_maybe rep_ty of
-     Just (_, _, _, [prim_ty]) ->
-        -- ASSERT(dataConSourceArity data_con == 1)
-        -- ASSERT2(isUnLiftedType prim_ty, ppr prim_ty)
+     Just (_, _, data_con, [prim_ty]) ->
+        ASSERT(dataConSourceArity data_con == 1)
+        ASSERT2(isUnliftedType prim_ty, ppr prim_ty)
         prim_ty
      _other -> pprPanic "DsForeign.getPrimTyOf" (ppr ty)
   where
