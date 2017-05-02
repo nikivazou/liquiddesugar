@@ -8,16 +8,15 @@ Pattern-matching literal patterns
 
 {-# LANGUAGE CPP, ScopedTypeVariables #-}
 
-module MatchLit ( dsLit, dsOverLit, hsLitKey, hsOverLitKey
+module Language.Haskell.Liquid.Desugar.MatchLit ( dsLit, dsOverLit, hsLitKey, hsOverLitKey
                 , tidyLitPat, tidyNPat
                 , matchLiterals, matchNPlusKPats, matchNPats
                 , warnAboutIdentities, warnAboutEmptyEnumerations
                 ) where
 
-#include "HsVersions.h"
 
-import {-# SOURCE #-} Match  ( match )
-import {-# SOURCE #-} DsExpr ( dsExpr, dsSyntaxExpr )
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.Match  ( match )
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr, dsSyntaxExpr )
 
 import DsMonad
 import DsUtils
@@ -98,8 +97,7 @@ dsLit (HsRat r ty) = do
   where
     (ratio_data_con, integer_ty)
         = case tcSplitTyConApp ty of
-                (tycon, [i_ty]) -> ASSERT(isIntegerTy i_ty && tycon `hasKey` ratioTyConKey)
-                                   (head (tyConDataCons tycon), i_ty)
+                (tycon, [i_ty]) -> (head (tyConDataCons tycon), i_ty)
                 x -> pprPanic "dsLit" (ppr x)
 
 dsOverLit :: HsOverLit Id -> DsM CoreExpr
@@ -341,8 +339,7 @@ matchLiterals :: [Id]
               -> DsM MatchResult
 
 matchLiterals (var:vars) ty sub_groups
-  = ASSERT( notNull sub_groups && all notNull sub_groups )
-    do  {       -- Deal with each group
+  = do  {       -- Deal with each group
         ; alts <- mapM match_group sub_groups
 
                 -- Combine results.  For everything except String
@@ -405,8 +402,7 @@ litValKey (HsIntegral _ i) False = MachInt i
 litValKey (HsIntegral _ i) True  = MachInt (-i)
 litValKey (HsFractional r) False = MachFloat (fl_value r)
 litValKey (HsFractional r) True  = MachFloat (negate (fl_value r))
-litValKey (HsIsString _ s) neg   = ASSERT( not neg) MachStr
-                                                      (fastStringToByteString s)
+litValKey (HsIsString _ s) neg   = MachStr (fastStringToByteString s)
 
 {-
 ************************************************************************

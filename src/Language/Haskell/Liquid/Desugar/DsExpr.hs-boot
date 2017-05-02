@@ -1,4 +1,4 @@
-module DsExpr where
+module Language.Haskell.Liquid.Desugar.DsExpr where
 import HsSyn    ( HsExpr, LHsExpr, HsLocalBinds, SyntaxExpr )
 import Var      ( Id )
 import DsMonad  ( DsM )

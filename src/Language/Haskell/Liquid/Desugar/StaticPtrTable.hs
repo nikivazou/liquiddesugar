@@ -40,7 +40,7 @@
 -- >
 -- > }
 --
-module StaticPtrTable (sptInitCode) where
+module Language.Haskell.Liquid.Desugar.StaticPtrTable (sptInitCode) where
 
 import CoreSyn
 import Module

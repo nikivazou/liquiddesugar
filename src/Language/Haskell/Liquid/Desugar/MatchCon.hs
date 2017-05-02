@@ -8,9 +8,7 @@ Pattern-matching constructors
 
 {-# LANGUAGE CPP #-}
 
-module MatchCon ( matchConFamily, matchPatSyn ) where
-
-#include "HsVersions.h"
+module Language.Haskell.Liquid.Desugar.MatchCon ( matchConFamily, matchPatSyn ) where
 
 import {-# SOURCE #-} Match     ( match )
 
@@ -119,8 +117,7 @@ matchOneConLike :: [Id]
                 -> [EquationInfo]
                 -> DsM (CaseAlt ConLike)
 matchOneConLike vars ty (eqn1 : eqns)   -- All eqns for a single constructor
-  = do  { let inst_tys = ASSERT( tvs1 `equalLength` ex_tvs )
-                         arg_tys ++ mkTyVarTys tvs1
+  = do  { let inst_tys = arg_tys ++ mkTyVarTys tvs1
 
               val_arg_tys = conLikeInstOrigArgTys con1 inst_tys
         -- dataConInstOrigArgTys takes the univ and existential tyvars
@@ -130,8 +127,7 @@ matchOneConLike vars ty (eqn1 : eqns)   -- All eqns for a single constructor
                           -> [(ConArgPats, EquationInfo)] -> DsM MatchResult
               -- All members of the group have compatible ConArgPats
               match_group arg_vars arg_eqn_prs
-                = ASSERT( notNull arg_eqn_prs )
-                  do { (wraps, eqns') <- liftM unzip (mapM shift arg_eqn_prs)
+                = do { (wraps, eqns') <- liftM unzip (mapM shift arg_eqn_prs)
                      ; let group_arg_vars = select_arg_vars arg_vars arg_eqn_prs
                      ; match_result <- match (group_arg_vars ++ vars) ty eqns'
                      ; return (adjustMatchResult (foldr1 (.) wraps) match_result) }
@@ -177,9 +173,7 @@ matchOneConLike vars ty (eqn1 : eqns)   -- All eqns for a single constructor
       | RecCon flds <- arg_pats
       , let rpats = rec_flds flds
       , not (null rpats)     -- Treated specially; cf conArgPats
-      = ASSERT2( length fields1 == length arg_vars,
-                 ppr con1 $$ ppr fields1 $$ ppr arg_vars )
-        map lookup_fld rpats
+      = map lookup_fld rpats
       | otherwise
       = arg_vars
       where

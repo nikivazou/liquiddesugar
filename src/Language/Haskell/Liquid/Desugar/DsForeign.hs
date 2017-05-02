@@ -8,9 +8,8 @@ Desugaring foreign declarations (see also DsCCall).
 
 {-# LANGUAGE CPP #-}
 
-module DsForeign ( dsForeigns ) where
+module Language.Haskell.Liquid.Desugar.DsForeign ( dsForeigns ) where
 
-#include "HsVersions.h"
 import TcRnMonad        -- temp
 
 import CoreSyn
@@ -154,7 +153,6 @@ dsCImport id co (CLabel cid) cconv _ _ = do
                  IsFunction
              _ -> IsData
    (resTy, foRhs) <- resultWrapper ty
-   ASSERT(fromJust resTy `eqType` addrPrimTy)    -- typechecker ensures this
     let
         rhs = foRhs (Lit (MachLabel cid stdcall_info fod))
         rhs' = Cast rhs co
@@ -198,9 +196,7 @@ dsFCall fn_id co fcall mDeclHeader = do
         ty                     = pFst $ coercionKind co
         (all_bndrs, io_res_ty) = tcSplitPiTys ty
         (named_bndrs, arg_tys) = partitionBindersIntoBinders all_bndrs
-        tvs                    = ASSERT( fst (span isNamedBinder all_bndrs)
-                                         `equalLength` named_bndrs )
-                                   -- ensure that the named binders all come first
+        tvs                    =   -- ensure that the named binders all come first
                                  map (binderVar "dsFCall") named_bndrs
                 -- Must use tcSplit* functions because we want to
                 -- see that (IO t) in the corner
@@ -305,7 +301,6 @@ dsPrimCall fn_id co fcall = do
                 -- Must use tcSplit* functions because we want to
                 -- see that (IO t) in the corner
 
-    MASSERT( fst (span isNamedBinder bndrs) `equalLength` tvs )
     args <- newSysLocalsDs arg_tys
 
     ccall_uniq <- newUnique
@@ -416,7 +411,6 @@ dsFExportDynamic :: Id
                  -> CCallConv
                  -> DsM ([Binding], SDoc, SDoc)
 dsFExportDynamic id co0 cconv = do
-    MASSERT( fst (span isNamedBinder bndrs) `equalLength` tvs )
       -- make sure that the named binders all come first
     fe_id <-  newSysLocalDs ty
     mod <- getModule
@@ -787,8 +781,6 @@ getPrimTyOf ty
   | otherwise =
   case splitDataProductType_maybe rep_ty of
      Just (_, _, data_con, [prim_ty]) ->
-        ASSERT(dataConSourceArity data_con == 1)
-        ASSERT2(isUnliftedType prim_ty, ppr prim_ty)
         prim_ty
      _other -> pprPanic "DsForeign.getPrimTyOf" (ppr ty)
   where

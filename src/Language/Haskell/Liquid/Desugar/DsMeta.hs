@@ -15,11 +15,9 @@
 -- a Royal Pain (triggers other recompilation).
 -----------------------------------------------------------------------------
 
-module DsMeta( dsBracket ) where
+module Language.Haskell.Liquid.Desugar.DsMeta( dsBracket ) where
 
-#include "HsVersions.h"
-
-import {-# SOURCE #-}   DsExpr ( dsExpr )
+import {-# SOURCE #-}   Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr )
 
 import MatchLit
 import DsMonad
@@ -1598,7 +1596,7 @@ globalVar name
         ; MkC uni <- coreIntLit (getKey (getUnique name))
         ; rep2 mkNameLName [occ,uni] }
   where
-      mod = ASSERT( isExternalName name) nameModule name
+      mod = nameModule name
       name_mod = moduleNameString (moduleName mod)
       name_pkg = unitIdString (moduleUnitId mod)
       name_occ = nameOccName name

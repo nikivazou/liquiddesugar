@@ -8,11 +8,9 @@ The @match@ function
 
 {-# LANGUAGE CPP #-}
 
-module Match ( match, matchEquations, matchWrapper, matchSimply, matchSinglePat ) where
+module Language.Haskell.Liquid.Desugar.Match ( match, matchEquations, matchWrapper, matchSimply, matchSinglePat ) where
 
-#include "HsVersions.h"
-
-import {-#SOURCE#-} DsExpr (dsLExpr, dsSyntaxExpr)
+import {-#SOURCE#-} Language.Haskell.Liquid.Desugar.DsExpr (dsLExpr, dsSyntaxExpr)
 
 import DynFlags
 import HsSyn
@@ -163,11 +161,9 @@ match :: [Id]             -- Variables rep\'ing the exprs we\'re matching with
       -> DsM MatchResult  -- Desugared result!
 
 match [] ty eqns
-  = ASSERT2( not (null eqns), ppr ty )
-    return (foldr1 combineMatchResults match_results)
+  = return (foldr1 combineMatchResults match_results)
   where
-    match_results = [ ASSERT( null (eqn_pats eqn) )
-                      eqn_rhs eqn
+    match_results = [ eqn_rhs eqn
                     | eqn <- eqns ]
 
 match vars@(v:_) ty eqns    -- Eqns *can* be empty
@@ -516,13 +512,11 @@ push_bang_into_newtype_arg :: SrcSpan -> HsConPatDetails Id -> HsConPatDetails I
 -- See Note [Bang patterns and newtypes]
 -- We are transforming   !(N p)   into   (N !p)
 push_bang_into_newtype_arg l (PrefixCon (arg:args))
-  = ASSERT( null args)
-    PrefixCon [L l (BangPat arg)]
+  = PrefixCon [L l (BangPat arg)]
 push_bang_into_newtype_arg l (RecCon rf)
   | HsRecFields { rec_flds = L lf fld : flds } <- rf
   , HsRecField { hsRecFieldArg = arg } <- fld
-  = ASSERT( null flds)
-    RecCon (rf { rec_flds = [L lf (fld { hsRecFieldArg = L l (BangPat arg) })] })
+  = RecCon (rf { rec_flds = [L lf (fld { hsRecFieldArg = L l (BangPat arg) })] })
 push_bang_into_newtype_arg _ cd
   = pprPanic "push_bang_into_newtype_arg" (pprConArgs cd)
 

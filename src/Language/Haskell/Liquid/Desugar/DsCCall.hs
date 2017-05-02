@@ -7,15 +7,13 @@ Desugaring foreign calls
 -}
 
 {-# LANGUAGE CPP #-}
-module DsCCall
+module Language.Haskell.Liquid.Desugar.DsCCall
         ( dsCCall
         , mkFCall
         , unboxArg
         , boxResult
         , resultWrapper
         ) where
-
-#include "HsVersions.h"
 
 
 import CoreSyn
@@ -114,8 +112,7 @@ mkFCall :: DynFlags -> Unique -> ForeignCall
 --      (ccallid::(forall a b.  StablePtr (a -> b) -> Addr -> Char -> IO Addr))
 --                      a b s x c
 mkFCall dflags uniq the_fcall val_args res_ty
-  = ASSERT( all isTyVar tyvars )  -- this must be true because the type is top-level
-    mkApps (mkVarApps (Var the_fcall_id) tyvars) val_args
+  = mkApps (mkVarApps (Var the_fcall_id) tyvars) val_args
   where
     arg_tys = map exprType val_args
     body_ty = (mkFunTys arg_tys res_ty)
@@ -157,9 +154,7 @@ unboxArg arg
   -- Data types with a single constructor, which has a single, primitive-typed arg
   -- This deals with Int, Float etc; also Ptr, ForeignPtr
   | is_product_type && data_con_arity == 1
-  = ASSERT2(isUnliftedType data_con_arg_ty1, pprType arg_ty)
-                        -- Typechecker ensures this
-    do case_bndr <- newSysLocalDs arg_ty
+  = do case_bndr <- newSysLocalDs arg_ty
        prim_arg <- newSysLocalDs data_con_arg_ty1
        return (Var prim_arg,
                \ body -> Case arg case_bndr (exprType body) [(DataAlt data_con,[prim_arg],body)]

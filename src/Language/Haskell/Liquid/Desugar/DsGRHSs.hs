@@ -8,9 +8,7 @@ Matching guarded right-hand-sides (GRHSs)
 
 {-# LANGUAGE CPP #-}
 
-module DsGRHSs ( dsGuarded, dsGRHSs, dsGRHS, isTrueLHsExpr ) where
-
-#include "HsVersions.h"
+module Language.Haskell.Liquid.Desugar.DsGRHSs ( dsGuarded, dsGRHSs, dsGRHS, isTrueLHsExpr ) where
 
 import {-# SOURCE #-} DsExpr  ( dsLExpr, dsLocalBinds )
 import {-# SOURCE #-} Match   ( matchSinglePat )
@@ -58,8 +56,7 @@ dsGRHSs :: HsMatchContext Name -> [Pat Id]      -- These are to build a MatchCon
         -> Type                                 -- Type of RHS
         -> DsM MatchResult
 dsGRHSs hs_ctx _ (GRHSs grhss (L _ binds)) rhs_ty
-  = ASSERT( notNull grhss )
-    do { match_results <- mapM (dsGRHS hs_ctx rhs_ty) grhss
+  = do { match_results <- mapM (dsGRHS hs_ctx rhs_ty) grhss
        ; let match_result1 = foldr1 combineMatchResults match_results
              match_result2 = adjustMatchResultDs (dsLocalBinds binds) match_result1
                              -- NB: nested dsLet inside matchResult

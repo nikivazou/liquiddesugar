@@ -6,15 +6,13 @@ Pattern Matching Coverage Checking.
 
 {-# LANGUAGE CPP, GADTs, DataKinds, KindSignatures #-}
 
-module Check (
+module Language.Haskell.Liquid.Desugar.Check (
         -- Checking and printing
         checkSingle, checkMatches, isAnyPmCheckEnabled,
 
         -- See Note [Type and Term Equality Propagation]
         genCaseTmCs1, genCaseTmCs2
     ) where
-
-#include "HsVersions.h"
 
 import TmOracle
 
@@ -410,13 +408,12 @@ translateConPatVec fam_insts  univ_tys  ex_tvs c (RecCon (HsRecFields fs _))
     -- The data constructor was not defined using record syntax. For the
     -- pattern to be in record syntax it should be empty (e.g. Just {}).
     -- So just like the previous case.
-  | null orig_lbls = ASSERT(null matched_lbls) mkPmVars arg_tys
+  | null orig_lbls = mkPmVars arg_tys
     -- Some of the fields appear, in the original order (there may be holes).
     -- Generate a simple constructor pattern and make up fresh variables for
     -- the rest of the fields
   | matched_lbls `subsetOf` orig_lbls
-  = ASSERT(length orig_lbls == length arg_tys)
-      let translateOne (lbl, ty) = case lookup lbl matched_pats of
+  =   let translateOne (lbl, ty) = case lookup lbl matched_pats of
             Just p  -> translatePat fam_insts p
             Nothing -> mkPmVars [ty]
       in  concatMapM translateOne (zip orig_lbls arg_tys)
@@ -657,7 +654,7 @@ pmPatType (PmVar  { pm_var_id  = x }) = idType x
 pmPatType (PmLit  { pm_lit_lit = l }) = pmLitType l
 pmPatType (PmNLit { pm_lit_id  = x }) = idType x
 pmPatType (PmGrd  { pm_grd_pv  = pv })
-  = ASSERT(patVecArity pv == 1) (pmPatType p)
+  = (pmPatType p)
   where Just p = find ((==1) . patternArity) pv
 
 -- | Generate a value abstraction for a given constructor (generate
@@ -684,7 +681,7 @@ mkOneConFull x con = do
       (univ_tvs, ex_tvs, eq_spec, thetas, arg_tys, _) = dataConFullSig con
       data_tc = dataConTyCon con   -- The representation TyCon
       tc_args = case splitTyConApp_maybe res_ty of
-                  Just (tc, tys) -> ASSERT( tc == data_tc ) tys
+                  Just (tc, tys) -> tys
                   Nothing -> pprPanic "mkOneConFull: Not TyConApp:" (ppr res_ty)
       subst1  = zipTvSubst univ_tvs tc_args
 

@@ -12,11 +12,9 @@ lower levels it is preserved with @let@/@letrec@s).
 
 {-# LANGUAGE CPP #-}
 
-module DsBinds ( dsTopLHsBinds, dsLHsBinds, decomposeRuleLhs, dsSpec,
+module Language.Haskell.Liquid.Desugar.DsBinds ( dsTopLHsBinds, dsLHsBinds, decomposeRuleLhs, dsSpec,
                  dsHsWrapper, dsTcEvBinds, dsTcEvBinds_s, dsEvBinds, dsMkUserRule
   ) where
-
-#include "HsVersions.h"
 
 import {-# SOURCE #-}   DsExpr( dsLExpr )
 import {-# SOURCE #-}   Match( matchWrapper )
@@ -1016,8 +1014,7 @@ dsHsWrapper (WpFun c1 c2 t1)  e = do { x <- newSysLocalDs t1
                                      ; e1 <- dsHsWrapper c1 (Var x)
                                      ; e2 <- dsHsWrapper c2 (mkCoreAppDs (text "dsHsWrapper") e e1)
                                      ; return (Lam x e2) }
-dsHsWrapper (WpCast co)       e = ASSERT(coercionRole co == Representational)
-                                  return $ mkCastDs e co
+dsHsWrapper (WpCast co)       e = return $ mkCastDs e co
 dsHsWrapper (WpEvLam ev)      e = return $ Lam ev e
 dsHsWrapper (WpTyLam tv)      e = return $ Lam tv e
 dsHsWrapper (WpEvApp    tm)   e = liftM (App e) (dsEvTerm tm)
@@ -1025,8 +1022,7 @@ dsHsWrapper (WpEvApp    tm)   e = liftM (App e) (dsEvTerm tm)
 --------------------------------------
 dsTcEvBinds_s :: [TcEvBinds] -> DsM [CoreBind]
 dsTcEvBinds_s []       = return []
-dsTcEvBinds_s (b:rest) = ASSERT( null rest )  -- Zonker ensures null
-                         dsTcEvBinds b
+dsTcEvBinds_s (b:rest) = dsTcEvBinds b
 
 dsTcEvBinds :: TcEvBinds -> DsM [CoreBind]
 dsTcEvBinds (TcEvBinds {}) = panic "dsEvBinds"    -- Zonker has got rid of this

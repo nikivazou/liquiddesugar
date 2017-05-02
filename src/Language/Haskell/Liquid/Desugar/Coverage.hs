@@ -5,7 +5,7 @@
 
 {-# LANGUAGE CPP, NondecreasingIndentation, RecordWildCards #-}
 
-module Coverage (addTicksToBinds, hpcInitCode) where
+module Language.Haskell.Liquid.Desugar.Coverage (addTicksToBinds, hpcInitCode) where
 
 #ifdef GHCI
 import qualified GHCi

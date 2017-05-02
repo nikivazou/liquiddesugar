@@ -8,9 +8,7 @@ Desugaring arrow commands
 
 {-# LANGUAGE CPP #-}
 
-module DsArrows ( dsProcExpr ) where
-
-#include "HsVersions.h"
+module Language.Haskell.Liquid.Desugar.DsArrows ( dsProcExpr ) where
 
 import Match
 import DsUtils

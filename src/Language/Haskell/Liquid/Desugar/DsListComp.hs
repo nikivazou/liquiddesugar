@@ -8,11 +8,9 @@ Desugaring list comprehensions, monad comprehensions and array comprehensions
 
 {-# LANGUAGE CPP, NamedFieldPuns #-}
 
-module DsListComp ( dsListComp, dsPArrComp, dsMonadComp ) where
+module Language.Haskell.Liquid.Desugar.DsListComp ( dsListComp, dsPArrComp, dsMonadComp ) where
 
-#include "HsVersions.h"
-
-import {-# SOURCE #-} DsExpr ( dsExpr, dsLExpr, dsLocalBinds, dsSyntaxExpr )
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr, dsLExpr, dsLocalBinds, dsSyntaxExpr )
 
 import HsSyn
 import TcHsSyn
@@ -214,7 +212,6 @@ deListComp [] _ = panic "deListComp"
 
 deListComp (LastStmt body _ _ : quals) list
   =     -- Figure 7.4, SLPJ, p 135, rule C above
-    ASSERT( null quals )
     do { core_body <- dsLExpr body
        ; return (mkConsExpr (exprType core_body) core_body list) }
 
@@ -319,8 +316,7 @@ dfListComp :: Id -> Id         -- 'c' and 'n'
 dfListComp _ _ [] = panic "dfListComp"
 
 dfListComp c_id n_id (LastStmt body _ _ : quals)
-  = ASSERT( null quals )
-    do { core_body <- dsLExpr body
+  = do { core_body <- dsLExpr body
        ; return (mkApps (Var c_id) [core_body, Var n_id]) }
 
         -- Non-last: must be a guard
@@ -519,8 +515,7 @@ dePArrComp [] _ _ = panic "dePArrComp"
 --  <<[:e' | :]>> pa ea = mapP (\pa -> e') ea
 --
 dePArrComp (LastStmt e' _ _ : quals) pa cea
-  = ASSERT( null quals )
-    do { mapP <- dsDPHBuiltin mapPVar
+  = do { mapP <- dsDPHBuiltin mapPVar
        ; let ty = parrElemType cea
        ; (clam, ty'e') <- deLambda ty pa e'
        ; return $ mkApps (Var mapP) [Type ty, Type ty'e', clam, cea] }
@@ -677,8 +672,7 @@ dsMcStmts (L loc stmt : lstmts) = putSrcSpanDs loc (dsMcStmt stmt lstmts)
 dsMcStmt :: ExprStmt Id -> [ExprLStmt Id] -> DsM CoreExpr
 
 dsMcStmt (LastStmt body _ ret_op) stmts
-  = ASSERT( null stmts )
-    do { body' <- dsLExpr body
+  = do { body' <- dsLExpr body
        ; dsSyntaxExpr ret_op [body'] }
 
 --   [ .. | let binds, stmts ]

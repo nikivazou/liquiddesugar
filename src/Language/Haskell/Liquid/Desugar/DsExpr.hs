@@ -8,10 +8,8 @@ Desugaring exporessions.
 
 {-# LANGUAGE CPP #-}
 
-module DsExpr ( dsExpr, dsLExpr, dsLocalBinds
+module Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr, dsLExpr, dsLocalBinds
               , dsValBinds, dsLit, dsSyntaxExpr ) where
-
-#include "HsVersions.h"
 
 import Match
 import MatchLit
@@ -113,8 +111,7 @@ ds_val_bind (NonRecursive, hsbinds) body
 ds_val_bind (_is_rec, binds) body
   = do  { (force_vars,prs) <- dsLHsBinds binds
         ; let body' = foldr seqVar body force_vars
-        ; ASSERT2( not (any (isUnliftedType . idType . fst) prs), ppr _is_rec $$ ppr binds )
-          case prs of
+        ; case prs of
             [] -> return body
             _  -> return (Let (Rec prs) body') }
         -- Use a Rec regardless of is_rec.
@@ -157,8 +154,6 @@ dsUnliftedBind (FunBind { fun_id = L _ fun
                -- Can't be a bang pattern (that looks like a PatBind)
                -- so must be simply unboxed
   = do { (args, rhs) <- matchWrapper (FunRhs (idName fun)) Nothing matches
-       ; MASSERT( null args ) -- Functions aren't lifted
-       ; MASSERT( isIdHsWrapper co_fn )
        ; let rhs' = mkOptTickBox tick rhs
        ; return (bindNonRec fun rhs' body) }
 
@@ -456,8 +451,7 @@ dsExpr (HsStatic expr@(L loc _)) = do
                  , occNameFS    $ nameOccName n'
                  ]
     let tvars = tyCoVarsOfTypeWellScoped ty
-        speTy = ASSERT( all isTyVar tvars )  -- ty is top-level, so this is OK
-                mkInvForAllTys tvars $ mkTyConApp staticPtrTyCon [ty]
+        speTy = mkInvForAllTys tvars $ mkTyConApp staticPtrTyCon [ty]
         speId = mkExportedVanillaId n' speTy
         fp@(Fingerprint w0 w1) = fingerprintName $ idName speId
         fp_core = mkConApp fingerprintDataCon
@@ -518,8 +512,7 @@ dsExpr (RecordCon { rcon_con_expr = con_expr, rcon_flds = rbinds
 
              mk_arg (arg_ty, fl)
                = case findField (rec_flds rbinds) (flSelector fl) of
-                   (rhs:rhss) -> ASSERT( null rhss )
-                                 dsLExpr rhs
+                   (rhs:rhss) -> dsLExpr rhs
                    []         -> mkErrorAppDs rEC_CON_ERROR_ID arg_ty (ppr (flLabel fl))
              unlabelled_bottom arg_ty = mkErrorAppDs rEC_CON_ERROR_ID arg_ty Outputable.empty
 
@@ -574,9 +567,7 @@ dsExpr expr@(RecordUpd { rupd_expr = record_expr, rupd_flds = fields
   | null fields
   = dsLExpr record_expr
   | otherwise
-  = ASSERT2( notNull cons_to_upd, ppr expr )
-
-    do  { record_expr' <- dsLExpr record_expr
+  = do  { record_expr' <- dsLExpr record_expr
         ; field_binds' <- mapM ds_field fields
         ; let upd_fld_env :: NameEnv Id -- Maps field name to the LocalId of the field binding
               upd_fld_env = mkNameEnv [(f,l) | (f,l,_) <- field_binds']
@@ -710,8 +701,7 @@ dsExpr (HsTick tickish e) = do
 
 dsExpr (HsBinTick ixT ixF e) = do
   e2 <- dsLExpr e
-  do { ASSERT(exprType e2 `eqType` boolTy)
-       mkBinaryTickBox ixT ixF e2
+  do { mkBinaryTickBox ixT ixF e2
      }
 
 dsExpr (HsTickPragma _ _ _ expr) = do
@@ -867,7 +857,7 @@ dsDo stmts
     goL (L loc stmt:lstmts) = putSrcSpanDs loc (go loc stmt lstmts)
 
     go _ (LastStmt body _ _) stmts
-      = ASSERT( null stmts ) dsLExpr body
+      = dsLExpr body
         -- The 'return' op isn't used for 'do' expressions
 
     go _ (BodyStmt rhs then_expr _ _) stmts
