@@ -55,8 +55,10 @@ Library
                     Language.Haskell.Liquid.Desugar.DsUtils,
                     Language.Haskell.Liquid.Desugar.Match,
                     Language.Haskell.Liquid.Desugar.MatchCon,
-                    Language.Haskell.Liquid.Desugar.MatchLit
-
+                    Language.Haskell.Liquid.Desugar.MatchLit,
+                    Language.Haskell.Liquid.Desugar.DsMonad,
+                    Language.Haskell.Liquid.Desugar.StaticPtrTable,
+                    Language.Haskell.Liquid.Desugar.TmOracle
    ghc-options: -W -fwarn-missing-signatures
    if flag(devel)
      ghc-options: -Werror
