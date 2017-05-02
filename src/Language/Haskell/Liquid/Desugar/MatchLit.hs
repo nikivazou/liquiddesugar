@@ -18,8 +18,8 @@ module Language.Haskell.Liquid.Desugar.MatchLit ( dsLit, dsOverLit, hsLitKey, hs
 import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.Match  ( match )
 import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr, dsSyntaxExpr )
 
-import DsMonad
-import DsUtils
+import Language.Haskell.Liquid.Desugar.DsMonad
+import Language.Haskell.Liquid.Desugar.DsUtils
 
 import HsSyn
 

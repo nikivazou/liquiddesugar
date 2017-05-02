@@ -10,14 +10,14 @@ Pattern-matching constructors
 
 module Language.Haskell.Liquid.Desugar.MatchCon ( matchConFamily, matchPatSyn ) where
 
-import {-# SOURCE #-} Match     ( match )
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.Match     ( match )
 
 import HsSyn
-import DsBinds
+import Language.Haskell.Liquid.Desugar.DsBinds
 import ConLike
 import TcType
-import DsMonad
-import DsUtils
+import Language.Haskell.Liquid.Desugar.DsMonad
+import Language.Haskell.Liquid.Desugar.DsUtils
 import MkCore   ( mkCoreLets )
 import Util
 import ListSetOps ( runs )

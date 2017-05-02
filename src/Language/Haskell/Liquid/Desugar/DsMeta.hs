@@ -19,8 +19,8 @@ module Language.Haskell.Liquid.Desugar.DsMeta( dsBracket ) where
 
 import {-# SOURCE #-}   Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr )
 
-import MatchLit
-import DsMonad
+import Language.Haskell.Liquid.Desugar.MatchLit
+import Language.Haskell.Liquid.Desugar.DsMonad
 
 import qualified Language.Haskell.TH as TH
 

@@ -11,18 +11,18 @@ Desugaring exporessions.
 module Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr, dsLExpr, dsLocalBinds
               , dsValBinds, dsLit, dsSyntaxExpr ) where
 
-import Match
-import MatchLit
-import DsBinds
-import DsGRHSs
-import DsListComp
-import DsUtils
-import DsArrows
-import DsMonad
+import Language.Haskell.Liquid.Desugar.Match
+import Language.Haskell.Liquid.Desugar.MatchLit
+import Language.Haskell.Liquid.Desugar.DsBinds
+import Language.Haskell.Liquid.Desugar.DsGRHSs
+import Language.Haskell.Liquid.Desugar.DsListComp
+import Language.Haskell.Liquid.Desugar.DsUtils
+import Language.Haskell.Liquid.Desugar.DsArrows
+import Language.Haskell.Liquid.Desugar.DsMonad
 import Name
 import NameEnv
 import FamInstEnv( topNormaliseType )
-import DsMeta
+import Language.Haskell.Liquid.Desugar.DsMeta
 import HsSyn
 
 import Platform
@@ -193,7 +193,6 @@ unliftedMatchOnly _ = False -- I hope!  Checked immediately by caller in fact
 -}
 
 dsLExpr :: LHsExpr Id -> DsM CoreExpr
-
 dsLExpr (L loc e) = putSrcSpanDs loc $ dsExpr e
 
 dsExpr :: HsExpr Id -> DsM CoreExpr

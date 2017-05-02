@@ -16,12 +16,12 @@ module Language.Haskell.Liquid.Desugar.DsBinds ( dsTopLHsBinds, dsLHsBinds, deco
                  dsHsWrapper, dsTcEvBinds, dsTcEvBinds_s, dsEvBinds, dsMkUserRule
   ) where
 
-import {-# SOURCE #-}   DsExpr( dsLExpr )
-import {-# SOURCE #-}   Match( matchWrapper )
+import {-# SOURCE #-}   Language.Haskell.Liquid.Desugar.DsExpr( dsLExpr )
+import {-# SOURCE #-}   Language.Haskell.Liquid.Desugar.Match( matchWrapper )
 
-import DsMonad
-import DsGRHSs
-import DsUtils
+import Language.Haskell.Liquid.Desugar.DsMonad
+import Language.Haskell.Liquid.Desugar.DsGRHSs
+import Language.Haskell.Liquid.Desugar.DsUtils
 
 import HsSyn            -- lots of things
 import CoreSyn          -- lots of things

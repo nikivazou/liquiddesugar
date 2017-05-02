@@ -10,9 +10,9 @@ Desugaring arrow commands
 
 module Language.Haskell.Liquid.Desugar.DsArrows ( dsProcExpr ) where
 
-import Match
-import DsUtils
-import DsMonad
+import Language.Haskell.Liquid.Desugar.Match
+import Language.Haskell.Liquid.Desugar.DsUtils
+import Language.Haskell.Liquid.Desugar.DsMonad
 
 import HsSyn    hiding (collectPatBinders, collectPatsBinders, collectLStmtsBinders, collectLStmtBinders, collectStmtBinders )
 import TcHsSyn
@@ -23,7 +23,7 @@ import qualified HsUtils
 --     So WATCH OUT; check each use of split*Ty functions.
 -- Sigh.  This is a pain.
 
-import {-# SOURCE #-} DsExpr ( dsExpr, dsLExpr, dsLocalBinds, dsSyntaxExpr )
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr ( dsExpr, dsLExpr, dsLocalBinds, dsSyntaxExpr )
 
 import TcType
 import TcEvidence
@@ -31,7 +31,7 @@ import CoreSyn
 import CoreFVs
 import CoreUtils
 import MkCore
-import DsBinds (dsHsWrapper)
+import Language.Haskell.Liquid.Desugar.DsBinds (dsHsWrapper)
 
 import Name
 import Var

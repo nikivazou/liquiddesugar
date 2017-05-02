@@ -17,15 +17,15 @@ import TcHsSyn
 import CoreSyn
 import MkCore
 
-import DsMonad          -- the monadery used in the desugarer
-import DsUtils
+import Language.Haskell.Liquid.Desugar.DsMonad          -- the monadery used in the desugarer
+import Language.Haskell.Liquid.Desugar.DsUtils
 
 import DynFlags
 import CoreUtils
 import Id
 import Type
 import TysWiredIn
-import Match
+import Language.Haskell.Liquid.Desugar.Match
 import PrelNames
 import SrcLoc
 import Outputable

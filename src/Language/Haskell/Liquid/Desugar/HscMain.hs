@@ -28,7 +28,7 @@
 
 module Language.Haskell.Liquid.Desugar.HscMain (hscDesugarWithLoc) where
 
-import Language.Haskell.Liquid.Desugar.Desugar (deSugarWithLoc)
+import Language.Haskell.Liquid.Desugar.Desugar (deSugar)
 import Prelude hiding (error)
 import Module
 import Lexer
@@ -69,7 +69,7 @@ hscDesugar' mod_location tc_result = do
     hsc_env <- getHscEnv
     r <- ioMsgMaybe $
       {-# SCC "deSugar" #-}
-      deSugarWithLoc hsc_env mod_location tc_result
+      deSugar hsc_env mod_location tc_result
 
     -- always check -Werror after desugaring, this is the last opportunity for
     -- warnings to arise before the backend.

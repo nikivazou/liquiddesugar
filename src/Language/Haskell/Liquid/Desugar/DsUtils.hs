@@ -38,14 +38,14 @@ module Language.Haskell.Liquid.Desugar.DsUtils (
         mkOptTickBox, mkBinaryTickBox, decideBangHood
     ) where
 
-import {-# SOURCE #-}   Match ( matchSimply )
+import {-# SOURCE #-}   Language.Haskell.Liquid.Desugar.Match ( matchSimply )
 
 import HsSyn
 import TcHsSyn
 import TcType( tcSplitTyConApp )
 import CoreSyn
-import DsMonad
-import {-# SOURCE #-} DsExpr ( dsLExpr )
+import Language.Haskell.Liquid.Desugar.DsMonad
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr ( dsLExpr )
 
 import CoreUtils
 import MkCore

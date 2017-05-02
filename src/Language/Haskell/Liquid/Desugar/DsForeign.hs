@@ -14,8 +14,8 @@ import TcRnMonad        -- temp
 
 import CoreSyn
 
-import DsCCall
-import DsMonad
+import Language.Haskell.Liquid.Desugar.DsCCall
+import Language.Haskell.Liquid.Desugar.DsMonad
 
 import HsSyn
 import DataCon
@@ -153,7 +153,7 @@ dsCImport id co (CLabel cid) cconv _ _ = do
                  IsFunction
              _ -> IsData
    (resTy, foRhs) <- resultWrapper ty
-    let
+   let
         rhs = foRhs (Lit (MachLabel cid stdcall_info fod))
         rhs' = Cast rhs co
         stdcall_info = fun_type_arg_stdcall_info dflags cconv ty

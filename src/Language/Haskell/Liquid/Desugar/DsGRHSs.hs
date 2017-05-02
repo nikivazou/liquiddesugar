@@ -10,16 +10,16 @@ Matching guarded right-hand-sides (GRHSs)
 
 module Language.Haskell.Liquid.Desugar.DsGRHSs ( dsGuarded, dsGRHSs, dsGRHS, isTrueLHsExpr ) where
 
-import {-# SOURCE #-} DsExpr  ( dsLExpr, dsLocalBinds )
-import {-# SOURCE #-} Match   ( matchSinglePat )
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.DsExpr  ( dsLExpr, dsLocalBinds )
+import {-# SOURCE #-} Language.Haskell.Liquid.Desugar.Match   ( matchSinglePat )
 
 import HsSyn
 import MkCore
 import CoreSyn
 import Var
 
-import DsMonad
-import DsUtils
+import Language.Haskell.Liquid.Desugar.DsMonad
+import Language.Haskell.Liquid.Desugar.DsUtils
 import TysWiredIn
 import PrelNames
 import Type   ( Type )

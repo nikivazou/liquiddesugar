@@ -1,7 +1,7 @@
 module Language.Haskell.Liquid.Desugar.DsMeta (dsBracket) where
 
 import CoreSyn
-import DsMonad
+import Language.Haskell.Liquid.Desugar.DsMonad
 import HsExpr
 import Name
 

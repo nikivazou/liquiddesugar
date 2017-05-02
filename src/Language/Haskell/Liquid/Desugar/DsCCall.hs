@@ -18,13 +18,13 @@ module Language.Haskell.Liquid.Desugar.DsCCall
 
 import CoreSyn
 
-import DsMonad
+import Language.Haskell.Liquid.Desugar.DsMonad
 import CoreUtils
 import MkCore
 import MkId
 import ForeignCall
 import DataCon
-import DsUtils
+import Language.Haskell.Liquid.Desugar.DsUtils
 
 import TcType
 import Type

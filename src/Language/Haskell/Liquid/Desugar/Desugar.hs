@@ -10,9 +10,10 @@ The Desugarer: turning HsSyn into Core.
 
 module Language.Haskell.Liquid.Desugar.Desugar (
     -- * Desugaring operations
-    deSugar, deSugarExpr,
+    deSugar, deSugarExpr, 
     -- * Dependency/fingerprinting code (used by MkIface)
-    mkUsageInfo, mkUsedNames, mkDependencies
+    mkUsageInfo, mkUsedNames, mkDependencies, 
+
     ) where
 
 
@@ -32,10 +33,10 @@ import CoreSyn
 import CoreFVs( exprsSomeFreeVarsList )
 import CoreSubst
 import PprCore
-import DsMonad
-import DsExpr
-import DsBinds
-import DsForeign
+import Language.Haskell.Liquid.Desugar.DsMonad
+import Language.Haskell.Liquid.Desugar.DsExpr
+import Language.Haskell.Liquid.Desugar.DsBinds
+import Language.Haskell.Liquid.Desugar.DsForeign
 import PrelNames   ( coercibleTyConKey )
 import TysPrim     ( eqReprPrimTyCon )
 import Unique      ( hasKey )
@@ -55,11 +56,11 @@ import FastString
 import ErrUtils
 import Outputable
 import SrcLoc
-import Coverage
+import Language.Haskell.Liquid.Desugar.Coverage
 import Util
 import MonadUtils
 import OrdList
-import StaticPtrTable
+import Language.Haskell.Liquid.Desugar.StaticPtrTable
 import UniqFM
 import ListSetOps
 import Fingerprint

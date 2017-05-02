@@ -14,7 +14,7 @@ module Language.Haskell.Liquid.Desugar.Check (
         genCaseTmCs1, genCaseTmCs2
     ) where
 
-import TmOracle
+import Language.Haskell.Liquid.Desugar.TmOracle
 
 import DynFlags
 import HsSyn
@@ -31,7 +31,7 @@ import Util
 import Outputable
 import FastString
 
-import DsMonad    -- DsM, initTcDsForSolver, getDictsDs
+import Language.Haskell.Liquid.Desugar.DsMonad    -- DsM, initTcDsForSolver, getDictsDs
 import TcSimplify -- tcCheckSatisfiability
 import TcType     -- toTcType, toTcTypeBag
 import Bag
@@ -40,7 +40,7 @@ import MonadUtils -- MonadIO
 import Var        -- EvVar
 import Type
 import UniqSupply
-import DsGRHSs    -- isTrueLHsExpr
+import Language.Haskell.Liquid.Desugar.DsGRHSs    -- isTrueLHsExpr
 
 import Data.List     -- find
 import Data.Maybe    -- isNothing, isJust, fromJust
