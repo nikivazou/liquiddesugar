@@ -1,6 +1,6 @@
 Name:                liquiddesugar
 Version:             8.0.2.0
-Copyright:           2010-17 Niki VAzou & Ranjit Jhala, University of California, San Diego.
+Copyright:           2010-17 Niki Vazou & Ranjit Jhala, University of California, San Diego.
 build-type:          Simple
 Synopsis:            Haskell to GHC Core Desugarar for Liquid Haskell
 Description:         Haskell to GHC Core Desugarar for Liquid Haskell.
